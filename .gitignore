@@ -1,0 +1,3 @@
+/build/
+# 含热点密码，从 app_config.example.h 复制后本地填写
+/app/app_config.h
