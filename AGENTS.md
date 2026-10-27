@@ -6,7 +6,7 @@
 
 STM32 课程设计「万年历时钟」。两人分工：A 负责算法、状态机与软件框架，B 负责驱动与硬件。评分按功能逐项上板验收，每项 5 分，所以「某项功能在真实硬件上可演示」是唯一的完成标准，host 测试通过只是前置条件。
 
-**当前状态**：开发板型号未定，仓库里只有与芯片无关的部分。没有 CubeMX/CubeIDE 工程，没有任何驱动，没有一项功能上过板。不要在文档、提交信息或回复里把任何功能写成「已验收」「已在硬件上验证」。
+**当前状态**（2026-10-27）：芯片经 SWD 读出是 STM32F101/F103 大容量型，丝印未看，板卡原理图未得。`firmware/` 有 CMake 交叉编译工程和一版不碰任何引脚的上板自检（`core/` 在目标上的计算结果与 PC 独立来源一致）。没有任何外设驱动，没有一项选题功能上过板。不要在文档、提交信息或回复里把任何功能写成「已验收」「已在硬件上验证」；上板自检通过不等于功能验收。
 
 ## 结构与不变量
 
@@ -17,6 +17,7 @@ app/app.c  app/app.h          应用层骨架，只经 port.h 碰硬件
 tests/                        host 单元测试；test_app.c 自带假 port 与脚本化 ESP8266
 tools/                        lunar_dump.c + verify_lunar.ps1：农历全范围核对
 scripts/host-test.ps1         配置 + 编译 + 跑测试
+firmware/                     固件工程：CMake + arm-none-eabi-gcc；说明与约定见 firmware/README.md
 ```
 
 必须守住的几条，破坏任何一条都要先停下来问人：
@@ -40,7 +41,9 @@ Windows，PATH 里不需要有 cmake / ninja / cl，脚本借用 Visual Studio �
 
 `host-test.ps1` 输出开头可能有一行 `'vswhere.exe' is not recognized…`，来自 VS 开发者环境脚本自身，无害，忽略。
 
-非 Windows 或已有工具链时：`cmake --preset host` 需要 `cl`；用 gcc/clang 就直接 `cmake -S . -B build/gcc -G Ninja && cmake --build build/gcc && ctest --test-dir build/gcc`，此时编译选项是 `-Wall -Wextra -Wpedantic -Wconversion -Werror`。gcc/clang 这条路径目前没人实际跑过，首次使用若有告警，修代码，不要放宽选项。
+非 Windows 或已有工具链时：`cmake --preset host` 需要 `cl`；用 gcc/clang 就直接 `cmake -S . -B build/gcc -G Ninja && cmake --build build/gcc && ctest --test-dir build/gcc`，此时编译选项是 `-Wall -Wextra -Wpedantic -Wconversion -Werror`。host 上的 gcc/clang 这条路径目前没人实际跑过，首次使用若有告警，修代码，不要放宽选项。交叉编译（`cmake --preset firmware`，arm-none-eabi-gcc 15.2）用的是同一套选项，2026-10-27 编 `core/` 零告警。
+
+动过 `firmware/` 时：编译零告警，并跑 `python firmware/scripts/selftest.py --flash`（会擦写板子），合计全过才算完成。
 
 改完代码的完成标准：上述测试实际跑过且全过。没跑就说没跑，不要凭推断报告「测试通过」。
 
@@ -58,19 +61,20 @@ Windows，PATH 里不需要有 cmake / ninja / cl，脚本借用 Visual Studio �
 
 - 不要提交 `app/app_config.h`（含热点密码，已被 `.gitignore` 挡住）；不要把任何真实凭据、姓名、学号写进仓库——这是公开仓库。
 - 不要提交 `build/`。
-- 不要猜引脚、芯片型号、外设编号或屏的型号。这些目前未定；需要时问人，或写成 `port.h` 后面的待实现项。
+- 不要猜引脚、芯片的具体型号（F101 还是 F103、封装）、外设编号或屏的型号。这些目前未定；需要时问人，或写成 `port.h` 后面的待实现项。
 - 不要为了让测试通过而删测试、放宽断言或关告警。
 - 不要在没有被要求时 push、改远程、改分支结构。
 
-## 未完成项（截至 2026-09-20）
+## 未完成项（截至 2026-10-27）
 
 | 项 | 归属 | 说明 |
 |---|---|---|
 | 闹钟（按 RTC 时刻触发）、番茄钟（25/5 循环） | B（基本功能 3） | 未实现。应写成 `core/` 里收 `now_ms` 或当前时间的状态机。单路秒表与定时可直接用 `mc_timers` |
 | 时间设置的编辑逻辑、整点报时判定 | B（基本功能 2） | 未实现。字段进位与合法性可复用 `mc_date.h` |
-| DS3231、DHT11、LCD、按键、蜂鸣器驱动；`port.h` 的真实实现 | B | 等开发板型号 |
+| DS3231、DHT11、LCD、按键、蜂鸣器驱动；`port.h` 的真实实现 | B | 等板卡原理图（芯片系列已知，引脚未知） |
 | 外部触发计时 | B（扩展功能 4） | 接法见 `README.md`「给 B」一节 |
 | 各功能的显示与按键界面 | 未分 | 等屏的型号。农历名称表是 UTF-8，GB2312 字库的屏要在显示层转码 |
 | ESP8266 真机联调 | A | `mc_sntp` 只对脚本化应答测过。不同 AT 固件的 `CIPSNTPCFG` 时区参数写法有差异，联调前先用串口助手手敲一遍 |
 | 农历 1900-01-01 至 1901-02-18 | — | 超出核对用参照实现的范围，仅有连续性检查与基准锚点，无独立逐日比对 |
-| CubeIDE 固件工程 | A | 等开发板型号。建在本仓库内，路径保持纯 ASCII |
+| 固件接上 `app/` 与 `port.h` | A | `firmware/` 现在只有上板自检。时钟仍是复位后的 HSI 8 MHz（实测快约 0.37%，不能用来走时），HSE 频率等原理图 |
+| 芯片丝印 | — | 定 F101/F103 与封装；是 F103 就改 `MC_MCU=STM32F103xE`，见 `firmware/README.md` |

@@ -12,7 +12,7 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Werror)
 endif()
 
-# 与芯片无关的核心算法库。固件工程里直接把 core/src 与 core/include 加进 CubeIDE 即可。
+# 与芯片无关的核心算法库。host 测试与固件链接的是同一份，交叉编译时同样受上面的 -Werror 约束。
 add_library(mc_core STATIC
     core/src/mc_date.c
     core/src/mc_lunar.c
@@ -21,6 +21,12 @@ add_library(mc_core STATIC
     core/src/mc_sntp.c
 )
 target_include_directories(mc_core PUBLIC core/include)
+
+# 交叉编译（firmware 预设）只出固件；下面的 PC 工具与测试在目标上没法跑
+if(CMAKE_CROSSCOMPILING)
+    add_subdirectory(firmware)
+    return()
+endif()
 
 add_executable(lunar_dump tools/lunar_dump.c)
 target_link_libraries(lunar_dump PRIVATE mc_core)

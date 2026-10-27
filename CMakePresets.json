@@ -10,10 +10,21 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_C_COMPILER": "cl"
       }
+    },
+    {
+      "name": "firmware",
+      "displayName": "Firmware (arm-none-eabi-gcc + Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/firmware",
+      "toolchainFile": "${sourceDir}/firmware/cmake/arm-none-eabi.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "host", "configurePreset": "host" }
+    { "name": "host", "configurePreset": "host" },
+    { "name": "firmware", "configurePreset": "firmware" }
   ],
   "testPresets": [
     {

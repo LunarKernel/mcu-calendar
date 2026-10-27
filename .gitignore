@@ -1,3 +1,5 @@
 /build/
+# 本机的工具链路径等，各机不同
+/CMakeUserPresets.json
 # 含热点密码，从 app_config.example.h 复制后本地填写
 /app/app_config.h
