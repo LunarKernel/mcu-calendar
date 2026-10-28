@@ -3,12 +3,14 @@
 
     python firmware/scripts/selftest.py --flash        # 擦除整片 Flash、烧录、复位，再核对
     python firmware/scripts/selftest.py                # 只核对，不写板子
+    python firmware/scripts/selftest.py --probe openocd  # 改走 OpenOCD（macOS 未装 CubeProgrammer 时）
 
 期望值的出处（不拿被测代码自己的输出当期望值）：
   - 1970-01-01 起的天数、星期、32 位时间戳：运行时用 Python 标准库现算；
   - 农历：.NET ChineseLunisolarCalendar（2026-10-27 在 Windows 上算出，写死在 LUNAR_EXPECTED）。
 
 读取用 CubeProgrammer 的 HOTPLUG 模式：不复位、不停核，读的是运行中的内存。
+OpenOCD 同理：reset_config none 且不发 halt，init 只做 examine，内存经 AHB-AP 直接读。
 g_selftest 的布局见 firmware/src/main.c，两边改动要同步，并对上 SELFTEST_VERSION。
 """
 from __future__ import annotations
@@ -88,23 +90,54 @@ def symbol_address(nm: str, elf: Path, name: str) -> int:
     sys.exit(f"{elf} 里找不到符号 {name}")
 
 
-def run_cli(cli: str, args: list[str], log: list[str]) -> str:
+def find_openocd(explicit: str | None) -> str:
+    for c in (explicit, os.environ.get("OPENOCD"), shutil.which("openocd")):
+        if c and Path(c).is_file():
+            return c
+    sys.exit("找不到 openocd：用 --openocd 或环境变量 OPENOCD 指定")
+
+
+def run_cli(cli: str, args: list[str], log: list[str], name: str = "STM32_Programmer_CLI",
+            error_mark: str = "Error") -> str:
     cmd = [cli, *args]
     proc = subprocess.run(cmd, capture_output=True)
     out = proc.stdout.decode("utf-8", errors="replace") + proc.stderr.decode("utf-8", errors="replace")
     # 进度条是非 ASCII 方块字符，留证时去掉
     kept = "\n".join(l for l in out.splitlines() if l.isascii())
-    log.append("$ STM32_Programmer_CLI " + " ".join(args) + "\n" + kept)
-    if proc.returncode != 0 or "Error" in out:
+    log.append(f"$ {name} " + " ".join(args) + "\n" + kept)
+    if proc.returncode != 0 or error_mark in out:
         print(kept)
         sys.exit(f"CLI 失败（退出码 {proc.returncode}）")
     return out
 
 
-def read_words(cli: str, addr: int, count: int, log: list[str]) -> tuple[list[int], float, float]:
+# ST-Link/V2 走 SWD；不接 NRST，复位一律用 SYSRESETREQ
+OPENOCD_SETUP = ["-f", "interface/stlink.cfg", "-c", "transport select swd",
+                 "-f", "target/stm32f1x.cfg", "-c", "reset_config none", "-c", "init"]
+
+
+def run_openocd(openocd: str, commands: list[str], log: list[str]) -> str:
+    args = OPENOCD_SETUP + [a for c in commands for a in ("-c", c)] + ["-c", "shutdown"]
+    return run_cli(openocd, args, log, name="openocd", error_mark="Error:")
+
+
+def flash(probe: str, tool: str, elf: Path, log: list[str]) -> None:
+    if probe == "openocd":
+        # 与 CubeProgrammer 的 -e all 对齐：先整片擦除，再写入、校验、复位运行
+        elf_tcl = elf.as_posix()
+        run_openocd(tool, ["reset halt", "stm32f1x mass_erase 0", f"program {{{elf_tcl}}} verify", "reset run"], log)
+    else:
+        run_cli(tool, ["-c", "port=SWD", "-e", "all", "-w", str(elf), "-v", "-rst"], log)
+
+
+def read_words(probe: str, tool: str, addr: int, count: int,
+               log: list[str]) -> tuple[list[int], float, float]:
     """返回（读回的字，CLI 调用起点，CLI 调用终点），时刻取 time.monotonic()。"""
     t0 = time.monotonic()
-    out = run_cli(cli, ["-c", "port=SWD", "mode=HOTPLUG", "-r32", f"0x{addr:08X}", f"0x{count * 4:X}"], log)
+    if probe == "openocd":
+        out = run_openocd(tool, [f"mdw 0x{addr:08X} {count}"], log)
+    else:
+        out = run_cli(tool, ["-c", "port=SWD", "mode=HOTPLUG", "-r32", f"0x{addr:08X}", f"0x{count * 4:X}"], log)
     t1 = time.monotonic()
     words: list[int] = []
     for m in re.finditer(r"^0x[0-9A-Fa-f]{8}\s*:\s*((?:[0-9A-Fa-f]{8}\s*)+)$", out, re.M):
@@ -133,7 +166,10 @@ class Checker:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--build-dir", type=Path, default=REPO / "build" / "firmware")
-    ap.add_argument("--cli")
+    ap.add_argument("--probe", choices=["cubeprog", "openocd"], default="cubeprog",
+                    help="烧录与读取用哪套工具，默认 STM32CubeProgrammer CLI")
+    ap.add_argument("--cli", help="STM32_Programmer_CLI 路径（--probe cubeprog）")
+    ap.add_argument("--openocd", help="openocd 路径（--probe openocd）")
     ap.add_argument("--flash", action="store_true", help="先擦除整片 Flash 并烧录、复位")
     ap.add_argument("--samples", type=int, default=4, help="读取次数（≥2），用来拟合时基速率")
     ap.add_argument("--interval", type=float, default=15.0, help="相邻两次读取之间的秒数")
@@ -145,21 +181,21 @@ def main() -> int:
     if not elf.is_file():
         sys.exit(f"没有 {elf}，先 cmake --build --preset firmware")
     nm = cache_value(build, "CMAKE_NM")
-    cli = find_cli(args.cli)
+    tool = find_openocd(args.openocd) if args.probe == "openocd" else find_cli(args.cli)
     addr = symbol_address(nm, elf, "g_selftest")
     log: list[str] = []
     print(f"ELF {elf}\ng_selftest @ 0x{addr:08X}，{WORDS} 字")
 
     if args.flash:
         print("擦除整片 Flash、烧录、校验、复位 ...")
-        run_cli(cli, ["-c", "port=SWD", "-e", "all", "-w", str(elf), "-v", "-rst"], log)
+        flash(args.probe, tool, elf, log)
         time.sleep(COUNTDOWN_MS / 1000 + 1.0)  # 等倒计时到点
 
     samples = []
     for i in range(max(2, args.samples)):
         if i:
             time.sleep(args.interval)
-        samples.append(read_words(cli, addr, WORDS, log))
+        samples.append(read_words(args.probe, tool, addr, WORDS, log))
         print(f"第 {i + 1} 次读取完成")
     w1, w2 = samples[0][0], samples[-1][0]
 
@@ -175,7 +211,7 @@ def main() -> int:
     c.check("到点时刻 - 起点（ms）", (w2[7] - w2[6]) & 0xFFFFFFFF, COUNTDOWN_MS)
 
     print("时基")
-    # 每次 CLI 调用约 1.4 s，读取落在调用中的哪一刻不知道，两点法的区间会宽到 ±5%。
+    # 每次 CLI 调用约 1.4 s（CubeProgrammer 实测），读取落在调用中的哪一刻不知道，两点法的区间会宽到 ±5%。
     # 改为多点拟合：分别对调用起点与终点做最小二乘，两个斜率一致，说明读取在调用内的位置稳定，估计可信。
     ticks = [s[0][4] for s in samples]
     unwrapped = [ticks[0]]
