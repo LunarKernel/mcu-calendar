@@ -7,7 +7,8 @@
 
 期望值的出处（不拿被测代码自己的输出当期望值）：
   - 1970-01-01 起的天数、星期、32 位时间戳：运行时用 Python 标准库现算；
-  - 农历：.NET ChineseLunisolarCalendar（2026-10-27 在 Windows 上算出，写死在 LUNAR_EXPECTED）。
+  - 农历：.NET ChineseLunisolarCalendar（2026-10-27 在 Windows 上算出，写死在 LUNAR_EXPECTED）；
+  - HSE 频率：板上没有别的独立时钟，用 PC 单调时钟拟合 SysTick 速率，乘 HSE_VALUE（8 MHz）得出。
 
 读取用 CubeProgrammer 的 HOTPLUG 模式：不复位、不停核，读的是运行中的内存。
 OpenOCD 同理：reset_config none 且不发 halt，init 只做 examine，内存经 AHB-AP 直接读。
@@ -29,9 +30,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 MAGIC = 0x4D434331
-VERSION = 1
+VERSION = 2
 DONE = 0xD0D0D0D0
 COUNTDOWN_MS = 5000
+LSE_TIMEOUT_MS = 5000  # 固件里 LSE 起振最多等这么久，之后才开始倒计时
+HSE_VALUE = 8_000_000
 HEADER_WORDS = 9
 DATE_WORDS = 10
 TS_WORDS = 2
@@ -55,7 +58,9 @@ LOCAL_TIMES = [
     (2106, 2, 7, 14, 28, 16),
     (1970, 1, 1, 7, 59, 59),
 ]
-WORDS = HEADER_WORDS + DATE_WORDS * len(DATES) + TS_WORDS * len(LOCAL_TIMES)
+CLOCK_BASE = HEADER_WORDS + DATE_WORDS * len(DATES) + TS_WORDS * len(LOCAL_TIMES)
+CLOCK_WORDS = 7  # sysclk_source, hse_ready, hse_wait_ms, bdcr_initial, lse_ready, lse_wait_ms, rtc_cnt
+WORDS = CLOCK_BASE + CLOCK_WORDS
 
 CLI_CANDIDATES = [
     r"C:\Program Files\STMicroelectronics\STM32Cube\STM32CubeProgrammer\bin\STM32_Programmer_CLI.exe",
@@ -189,7 +194,7 @@ def main() -> int:
     if args.flash:
         print("擦除整片 Flash、烧录、校验、复位 ...")
         flash(args.probe, tool, elf, log)
-        time.sleep(COUNTDOWN_MS / 1000 + 1.0)  # 等倒计时到点
+        time.sleep((LSE_TIMEOUT_MS + COUNTDOWN_MS) / 1000 + 1.0)  # 等 LSE 探测与倒计时都结束
 
     samples = []
     for i in range(max(2, args.samples)):
@@ -204,7 +209,10 @@ def main() -> int:
     c.check("magic", hex(w2[0]), hex(MAGIC))
     c.check("version", w2[1], VERSION)
     c.check("自检完成标志", hex(w2[3]), hex(DONE))
-    c.check("SYSCLK（Hz，复位后的 HSI）", w2[2], 8_000_000)
+    clk = w2[CLOCK_BASE:CLOCK_BASE + CLOCK_WORDS]
+    on_hse = clk[0] == 1
+    # HAL 按 HSE_VALUE 反算，HSE 与 HSI 都报 8 MHz；HSE 的真实频率看下面的时基拟合
+    c.check(f"SYSCLK（Hz，HAL 反算，时钟源 {'HSE' if on_hse else 'HSI'}）", w2[2], 8_000_000)
 
     print("倒计时（mc_countdown，真实 SysTick 驱动）")
     c.check("已到点", w2[8], 1)
@@ -227,7 +235,12 @@ def main() -> int:
     rate = (k_start + k_end) / 2
     print(f"  {len(samples)} 点拟合 tick/ms：按调用起点 {k_start:.5f}，按调用终点 {k_end:.5f}")
     c.check("起点、终点两种拟合相差 < 0.1%", abs(k_start - k_end) < 1e-3, True)
-    c.check(f"tick 速率 {rate:.5f} 在 HSI 出厂精度量级 ±3% 内", abs(rate - 1) <= 0.03, True)
+    if on_hse:
+        # 晶振误差在 ±100 ppm 量级，PC 时钟同量级；放到 0.1% 已足够把 8 MHz 与 12、16 MHz 等分开
+        print(f"  HSE 测得 {rate * HSE_VALUE / 1e6:.4f} MHz（tick 速率 × {HSE_VALUE / 1e6:g} MHz）")
+        c.check(f"tick 速率 {rate:.5f} 与 HSE_VALUE 8 MHz 相符（±0.1%）", abs(rate - 1) <= 0.001, True)
+    else:
+        c.check(f"tick 速率 {rate:.5f} 在 HSI 出厂精度量级 ±3% 内", abs(rate - 1) <= 0.03, True)
     c.check("主循环在跑", ((w2[5] - w1[5]) & 0xFFFFFFFF) > 0, True)
 
     epoch = dt.date(1970, 1, 1)
@@ -252,6 +265,24 @@ def main() -> int:
         c.check(f"{tag} 是否在范围内", bool(ok_word), in_range)
         if in_range:
             c.check(f"{tag} 时间戳", ts, want)
+
+    print("时钟探测（version 2）")
+    c.check("HSE 起振（HSERDY）", clk[1], 1)
+    c.check("SYSCLK 已切到 HSE（SWS=01）", clk[0], 1)
+    if clk[1]:
+        print(f"  HSE 起振用时 {clk[2]} ms")
+    bdcr = clk[3]
+    rtcsel = {0: "无", 1: "LSE", 2: "LSI", 3: "HSE/128"}[(bdcr >> 8) & 3]
+    print(f"  碰备份域前 RCC_BDCR = 0x{bdcr:08X}：LSEON={bdcr & 1}，LSERDY={(bdcr >> 1) & 1}，"
+          f"RTCSEL={rtcsel}，RTCEN={(bdcr >> 15) & 1}")
+    c.check("LSE 起振（LSERDY）", clk[4], 1)
+    if clk[4]:
+        print(f"  LSE 起振用时 {clk[5]} ms（若之前已在跑则接近 0）")
+    if (bdcr >> 15) & 1:
+        # 预分频由先前的程序设定，这里不知道，只报计数速率，不判
+        cnts = [s[0][CLOCK_BASE + 6] for s in samples]
+        span = samples[-1][1] - samples[0][1]
+        print(f"  RTC 计数 {cnts[0]} -> {cnts[-1]}，{span:.1f} s 内走了 {(cnts[-1] - cnts[0]) & 0xFFFFFFFF} 个数（只报不判）")
 
     summary = f"合计：通过 {c.passed}，失败 {c.failed}"
     print(summary)

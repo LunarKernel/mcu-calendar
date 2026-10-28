@@ -1,10 +1,10 @@
 # STM32F10xxE 固件。顶层在交叉编译时 add_subdirectory 进来，链接的是顶层那份 mc_core。
 enable_language(ASM)
 
-# 芯片：DEV_ID 0x414 只定到 F101/F103 大容量型，两者寄存器上分不出，要看丝印。
-# 丝印定之前按 F101xE 编：它是 F103xE 的子集（36 MHz、48 KB RAM、无 USB/CAN/TIM1/TIM8），
-# 按它编出的固件两种芯片都能跑；反过来不行。
-set(MC_MCU "STM32F101xE" CACHE STRING "目标芯片，按丝印定：STM32F101xE 或 STM32F103xE")
+# 芯片：DEV_ID 0x414 只定到 F101/F103 大容量型，两者寄存器上分不出。
+# 2026-10-28 丝印直读「STM32F103」（板为普中 Z300），默认改为 F103xE：RAM 按 64 KB 链接。
+# F101xE 是它的子集（36 MHz、48 KB RAM、无 USB/CAN/TIM1/TIM8），换到 F101 的板子上要改回。
+set(MC_MCU "STM32F103xE" CACHE STRING "目标芯片，按丝印定：STM32F101xE 或 STM32F103xE")
 set_property(CACHE MC_MCU PROPERTY STRINGS STM32F101xE STM32F103xE)
 string(TOLOWER "${MC_MCU}" mc_mcu_lower)
 if(NOT mc_mcu_lower MATCHES "^stm32f10[13]xe$")

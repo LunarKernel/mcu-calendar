@@ -2,11 +2,12 @@
 
 CMake ＋ arm-none-eabi-gcc，Windows 与 macOS 用同一套命令。顶层 `CMakeLists.txt` 在交叉编译时把本目录加进来，链接的是 host 测试用的同一份 `mc_core`。
 
-## 现状（2026-10-27）
+## 现状（2026-10-28）
 
-- 芯片：经 SWD 读 DBGMCU_IDCODE 得 DEV_ID 0x414，即 STM32F101/F103 大容量型，512 KB Flash。两者寄存器上分不出，封装也读不出，要看丝印。
-- 板卡名称、原理图未得，所以这一版**不碰任何 GPIO 与外设引脚**，时钟是复位后的 HSI 8 MHz。
-- 唯一的程序是上板自检（`src/main.c`）：`core/` 在目标上算日期、农历、时间戳，`mc_countdown` 由真实 SysTick 驱动，结果放在 RAM 里的 `g_selftest`，PC 端经 SWD 只读取回比对。10/27 实测 41 项全过。
+- 芯片：经 SWD 读 DBGMCU_IDCODE 得 DEV_ID 0x414（F101/F103 大容量型，512 KB Flash）；10/28 丝印直读「STM32F103」，`MC_MCU` 默认改为 `STM32F103xE`。封装后缀丝印太淡未读出，板上引出 PF/PG，推断为 ZET6（144 脚），未直读。
+- 板卡：普中（PRECHIN）Z300。原理图未得，所以这一版仍**不碰任何 GPIO 与外设引脚**，只动 RCC 与备份域。
+- 时钟：HSE 起振，SYSCLK 切到 HSE（不经 PLL）；10/28 以 PC 时钟拟合测得 8.0006 MHz。LSE（32.768 kHz）起振用时约 2.9 s；LSE 频率未测。
+- 唯一的程序是上板自检（`src/main.c`）：`core/` 在目标上算日期、农历、时间戳，`mc_countdown` 由真实 SysTick 驱动，再加 HSE、LSE 探测；结果放在 RAM 里的 `g_selftest`，PC 端经 SWD 只读取回比对。10/27 版 41 项、10/28 版（version 2）44 项实测全过。
 - 这不是功能验收：没有显示、按键、RTC，选题表里没有一项功能因此算完成。
 
 ## 工具
@@ -67,13 +68,13 @@ PATH 里已有编译器时，前两行的 `firmware-local` 换成 `firmware`。
 
 ## 芯片选择：F101 还是 F103
 
-缓存变量 `MC_MCU` 决定宏定义、启动文件与链接脚本，默认 `STM32F101xE`。F101xE 是 F103xE 的子集（36 MHz、48 KB RAM、无 USB/CAN/TIM1/TIM8），按它编出的固件在两种芯片上都能跑，反过来不行。丝印确认是 F103 之后：
+缓存变量 `MC_MCU` 决定宏定义、启动文件与链接脚本，默认 `STM32F103xE`（10/28 丝印直读）。F101xE 是 F103xE 的子集（36 MHz、48 KB RAM、无 USB/CAN/TIM1/TIM8），按 F103xE 编出的固件放到 F101 上，RAM 会越界。换到 F101 的板子上：
 
 ```
-cmake --preset firmware-local -DMC_MCU=STM32F103xE
+cmake --preset firmware-local -DMC_MCU=STM32F101xE
 ```
 
-然后 RAM 按 64 KB 链接，才可以把主频配到 72 MHz。
+缓存里已有旧值时，先删掉 `build/firmware` 再配置。
 
 ## 几处不显然的决定
 
