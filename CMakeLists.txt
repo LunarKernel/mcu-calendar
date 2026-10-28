@@ -19,6 +19,8 @@ add_library(mc_core STATIC
     core/src/mc_calview.c
     core/src/mc_timers.c
     core/src/mc_sntp.c
+    core/src/mc_alarm.c
+    core/src/mc_pomodoro.c
 )
 target_include_directories(mc_core PUBLIC core/include)
 
@@ -33,7 +35,7 @@ target_link_libraries(lunar_dump PRIVATE mc_core)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(name date lunar timers sntp)
+    foreach(name date lunar timers sntp alarm pomodoro)
         add_executable(test_${name} tests/test_${name}.c)
         target_link_libraries(test_${name} PRIVATE mc_core)
         add_test(NAME ${name} COMMAND test_${name})

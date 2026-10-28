@@ -54,7 +54,7 @@ A 的代码只调用 `app/port.h` 里的六个函数，B 的驱动只需要实�
 本机 PATH 里不需要有 cmake / ninja / cl，脚本借 Visual Studio 自带的那一套（需装「使用 C++ 的桌面开发」与「用于 Windows 的 C++ CMake 工具」）：
 
 ```powershell
-.\scripts\host-test.ps1        # 配置、编译（/W4 /WX）、跑 5 组测试
+.\scripts\host-test.ps1        # 配置、编译（/W4 /WX）、跑 7 组测试
 .\tools\verify_lunar.ps1       # 农历查表 vs .NET ChineseLunisolarCalendar 逐日比对
 ```
 
@@ -68,5 +68,5 @@ A 的代码只调用 `app/port.h` 里的六个函数，B 的驱动只需要实�
 - 校园网要 web 认证，ESP8266 过不去，校时用手机 2.4 GHz 热点。
 - 农历名称表是 UTF-8。ST7920 一类自带 GB2312 字库的屏需要在显示层转码；屏的型号未定，定了再做。
 - 秒表与倒计时用 32 位毫秒时基，单次连续运行上限约 49.7 天。
-- 闹钟、番茄钟、单路秒表在选题表里归 B（基本 3）。`mc_timers` 的多路实现已经覆盖单路秒表与定时，B 可以直接用，不必另写一份；闹钟（按 RTC 时刻触发）与番茄钟（25/5 循环）尚未实现。
+- 闹钟、番茄钟、单路秒表在选题表里归 B（基本 3）。`mc_timers` 的多路实现已经覆盖单路秒表与定时，B 可以直接用，不必另写一份；闹钟（`mc_alarm`，按 RTC 时刻触发，单次或按星期重复）与番茄钟（`mc_pomodoro`，默认 25/5 循环，段间按期限衔接不累积滞后）2026-10-28 已写成 `core/` 模块并 host 测过，尚未接进 `app/`、未上板。
 - CubeIDE 的 make 构建对路径里的括号、空格与非 ASCII 字符不可靠，克隆本仓库与建固件工程都用纯 ASCII 路径。
