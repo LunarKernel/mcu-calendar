@@ -46,28 +46,53 @@ target_include_directories(st_hal SYSTEM PUBLIC
 )
 target_compile_definitions(st_hal PUBLIC ${MC_MCU} USE_HAL_DRIVER)
 
-add_executable(mcu_calendar_fw
-    src/main.c
-    src/stm32f1xx_it.c
-    src/crt_stubs.c
-    ${ST_DEVICE}/Source/Templates/gcc/startup_${mc_mcu_lower}.s
-)
-target_compile_options(mcu_calendar_fw PRIVATE "$<$<COMPILE_LANGUAGE:C>:${mc_strict_options}>")
-target_link_libraries(mcu_calendar_fw PRIVATE mc_core st_hal)
-
 set(mc_ld_dir ${CMAKE_CURRENT_SOURCE_DIR}/ld)
-target_link_options(mcu_calendar_fw PRIVATE
-    -L${mc_ld_dir}
-    -T${mc_ld_dir}/${mc_mcu_lower}.ld
-    -Wl,-Map=$<TARGET_FILE_DIR:mcu_calendar_fw>/mcu_calendar_fw.map
-    -Wl,--print-memory-usage
+
+# 两个固件共用的编译、链接与产物设置
+function(mc_add_firmware target)
+    add_executable(${target} ${ARGN}
+        src/stm32f1xx_it.c
+        src/crt_stubs.c
+        ${ST_DEVICE}/Source/Templates/gcc/startup_${mc_mcu_lower}.s
+    )
+    target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:C>:${mc_strict_options}>")
+    target_link_libraries(${target} PRIVATE mc_core st_hal)
+    target_link_options(${target} PRIVATE
+        -L${mc_ld_dir}
+        -T${mc_ld_dir}/${mc_mcu_lower}.ld
+        -Wl,-Map=$<TARGET_FILE_DIR:${target}>/${target}.map
+        -Wl,--print-memory-usage
+    )
+    set_target_properties(${target} PROPERTIES
+        SUFFIX .elf
+        LINK_DEPENDS "${mc_ld_dir}/${mc_mcu_lower}.ld;${mc_ld_dir}/stm32f1_sections.ld"
+    )
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:${target}> $<TARGET_FILE_DIR:${target}>/${target}.hex
+        COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${target}> $<TARGET_FILE_DIR:${target}>/${target}.bin
+        VERBATIM
+    )
+endfunction()
+
+# 上板自检：不碰引脚，只验 core/ 与时钟；selftest.py 读的是它
+mc_add_firmware(mcu_selftest_fw src/selftest_main.c)
+
+# 应用固件：板级驱动 + port.h 实现 + app/
+mc_add_firmware(mcu_calendar_fw
+    src/main.c
+    src/bsp_clock.c
+    src/bsp_gpio.c
+    src/bsp_uart.c
+    src/bsp_rtc.c
+    src/bsp_lcd.c
+    src/port_impl.c
+    ${PROJECT_SOURCE_DIR}/app/app.c
 )
-set_target_properties(mcu_calendar_fw PROPERTIES
-    SUFFIX .elf
-    LINK_DEPENDS "${mc_ld_dir}/${mc_mcu_lower}.ld;${mc_ld_dir}/stm32f1_sections.ld"
-)
-add_custom_command(TARGET mcu_calendar_fw POST_BUILD
-    COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:mcu_calendar_fw> $<TARGET_FILE_DIR:mcu_calendar_fw>/mcu_calendar_fw.hex
-    COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:mcu_calendar_fw> $<TARGET_FILE_DIR:mcu_calendar_fw>/mcu_calendar_fw.bin
-    VERBATIM
-)
+# app_config.h 含热点密码、不入库。本机没建就退回 host 测试那份假凭据：能编能跑，只是网络校时连不上
+if(EXISTS ${PROJECT_SOURCE_DIR}/app/app_config.h)
+    set(mc_app_config_dir ${PROJECT_SOURCE_DIR}/app)
+else()
+    set(mc_app_config_dir ${PROJECT_SOURCE_DIR}/tests/host_config)
+    message(WARNING "没有 app/app_config.h，固件用 tests/host_config 的假凭据编译；网络校时前先从 app_config.example.h 复制一份填好")
+endif()
+target_include_directories(mcu_calendar_fw PRIVATE ${PROJECT_SOURCE_DIR}/app ${mc_app_config_dir})

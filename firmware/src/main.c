@@ -1,192 +1,245 @@
-/* 首版上板自检。
+/* 应用固件：板级初始化后把 app/ 跑在主循环里。
  *
- * 板卡原理图未得，这一版不碰任何 GPIO 与外设引脚（引脚一个都不猜），只动 RCC 与备份域；
- * 结果写进 g_selftest，由 SWD 只读取回、在 PC 上与独立来源比对
- * （firmware/scripts/selftest.py，期望值的出处写在那边）。要验的是五件事：
- *   1. core/ 在 Cortex-M3 上算出的日期、农历、时间戳与 PC 上的独立实现一致；
- *   2. SysTick 毫秒时基按真实时间走；
- *   3. mc_countdown 拿真实时基驱动，到点时刻准确；
- *   4. HSE 能起振，频率是多少：起振后 SYSCLK 切到 HSE，SysTick 按 HSE_VALUE（8 MHz）配成 1 ms，
- *      PC 端拟合出的 tick 速率乘 8 MHz 即 HSE 实际频率。板上没有别的独立时钟可比，只能借 PC；
- *   5. LSE（32.768 kHz）能起振：只置 LSEON 看 LSERDY，不改 RTCSEL、不复位备份域，
- *      原有的 RTC 配置（若厂家程序留下过）原样保留。LSEON 在有 VBAT 供电时会留在备份域里，无害。
+ * 这一版（板级底座）能做的：72 MHz 时钟、两路串口、片内 RTC 走时、按键与蜂鸣器、读屏 ID；
+ * 屏还没有初始化序列，所以人机界面暂时走调试串口（USART1，115200 8N1，经 USB2 的 CH340）：
+ *   - 每秒打印一行本地时间；整点响一声（基本功能 2 的报时）；
+ *   - 收到「T2026-10-29 16:45:00」一行即校时，PC 上可以 `date "+T%Y-%m-%d %H:%M:%S"` 发过来；
+ *   - 收到「?」打印一次状态。
+ * 按键：KEY0 短鸣一声，KEY1 打印状态，KEY_UP 发起网络校时（app_request_sync）。
  *
- * g_selftest 只由 32 位字组成，SWD 读回后按字解析，不受结构体填充影响。
- * 布局改了要同步改 selftest.py，并把 SELFTEST_VERSION 加一。 */
+ * 另有 g_diag 放在 RAM 里，只插 ST-Link、不接串口时，也能经 SWD 只读取回看状态。 */
 #include <stdint.h>
 
+#include "app.h"
+#include "bsp.h"
+#include "fw.h"
+#include "port.h"
 #include "stm32f1xx_hal.h"
 
 #include "mc/mc_date.h"
-#include "mc/mc_lunar.h"
-#include "mc/mc_timers.h"
+#include "mc/mc_key.h"
+#include "mc/mc_text.h"
 
-#define SELFTEST_MAGIC 0x4D434331u /* "MCC1" */
-#define SELFTEST_VERSION 2u
-#define SELFTEST_DONE 0xD0D0D0D0u
-#define SELFTEST_COUNTDOWN_MS 5000u
-#define SELFTEST_DATES 6u
-#define SELFTEST_TIMESTAMPS 5u
+#define DIAG_MAGIC 0x4D434631u /* "MCF1" */
+#define DIAG_VERSION 1u
+#define KEY_POLL_MS 5u
+#define KEY_BEEP_MS 40u
+#define CHIME_BEEP_MS 500u
+#define CMD_MAX 32u
 
-typedef struct {
-    int32_t year; /* 输入回显，防止 PC 端期望值与这里的顺序错位 */
-    int32_t month;
-    int32_t day;
-    int32_t days_from_epoch;
-    uint32_t weekday;
-    uint32_t lunar_ok;
-    int32_t lunar_year;
-    uint32_t lunar_month;
-    uint32_t lunar_day;
-    uint32_t lunar_leap;
-} selftest_date_t;
-
-typedef struct {
-    uint32_t ok;
-    uint32_t ts;
-} selftest_ts_t;
-
+/* 只由 32 位字组成，SWD 读回按字解析；布局改了要加 DIAG_VERSION */
 typedef struct {
     uint32_t magic;
     uint32_t version;
-    uint32_t sysclk_hz; /* 按 RCC 寄存器反算，不是 SystemCoreClock 变量 */
-    uint32_t done;
+    uint32_t sysclk_hz;
+    uint32_t clock_ok; /* 1 = 已切到 PLL 72 MHz */
+    uint32_t lcd_id;
+    uint32_t rtc_ok;
+    uint32_t rtc_retained; /* 1 = 上电时 RTC 已在跑，断电期间备份域保住了 */
+    uint32_t rtc_time_set;
+    uint32_t bdcr_initial;
+    uint32_t lse_wait_ms;
+    uint32_t rtc_seconds; /* UTC 秒，主循环里刷新 */
     uint32_t tick_ms;
     uint32_t loops;
-    uint32_t countdown_start_ms;
-    uint32_t countdown_fired_ms;
-    uint32_t countdown_fired;
-    selftest_date_t date[SELFTEST_DATES];
-    selftest_ts_t ts[SELFTEST_TIMESTAMPS];
-    /* 以下 version 2 起：时钟探测。追加在末尾，前面各字的偏移不变 */
-    uint32_t sysclk_source; /* 0 = HSI，1 = HSE（RCC_CFGR.SWS 读回） */
-    uint32_t hse_ready;
-    uint32_t hse_wait_ms; /* 置 HSEON 到 HSERDY 的毫秒数，按 HSI 时基计 */
-    uint32_t bdcr_initial; /* 碰备份域之前的 RCC_BDCR 原值 */
-    uint32_t lse_ready;
-    uint32_t lse_wait_ms;
-    uint32_t rtc_cnt; /* RTC 计数器，主循环里刷新；RTC 未使能时无意义 */
-} selftest_t;
+    uint32_t key_press[BSP_KEY_COUNT];
+    uint32_t esp_rx_dropped;
+    uint32_t sync_state;
+} fw_diag_t;
 
-volatile selftest_t g_selftest;
+volatile fw_diag_t g_diag;
 
-/* 两个闰月（2020 闰四月、2033 闰十一月）、闰日、农历表两端 */
-static const mc_date_t k_dates[SELFTEST_DATES] = {
-    {2026, 10, 27}, {2000, 2, 29}, {2020, 5, 23}, {2033, 12, 22}, {1901, 2, 19}, {2100, 12, 31},
-};
+static bool s_beeping;
+static uint32_t s_beep_until;
 
-/* 北京时间；32 位无符号时间戳的两端各取一个刚好在内、一个刚好越界的点 */
-static const mc_datetime_t k_local_times[SELFTEST_TIMESTAMPS] = {
-    {.date = {1970, 1, 1}, .hour = 8, .minute = 0, .second = 0},
-    {.date = {2026, 10, 27}, .hour = 0, .minute = 0, .second = 0},
-    {.date = {2106, 2, 7}, .hour = 14, .minute = 28, .second = 15},
-    {.date = {2106, 2, 7}, .hour = 14, .minute = 28, .second = 16},
-    {.date = {1970, 1, 1}, .hour = 7, .minute = 59, .second = 59},
-};
-
-/* HSE 起振后切为 SYSCLK。失败则留在 HSI，sysclk_source 报 0。
- * HSE 在 F103 上限 16 MHz，0 等待周期的 Flash 够用（≤ 24 MHz），不必先改 latency。 */
-static void probe_hse(void)
+void fw_beep(uint32_t ms)
 {
-    const uint32_t t0 = HAL_GetTick();
-    SET_BIT(RCC->CR, RCC_CR_HSEON);
-    while (READ_BIT(RCC->CR, RCC_CR_HSERDY) == 0u) {
-        if (HAL_GetTick() - t0 > HSE_STARTUP_TIMEOUT) {
-            CLEAR_BIT(RCC->CR, RCC_CR_HSEON);
-            return;
-        }
-    }
-    g_selftest.hse_ready = 1u;
-    g_selftest.hse_wait_ms = HAL_GetTick() - t0;
-
-    MODIFY_REG(RCC->CFGR, RCC_CFGR_SW, RCC_CFGR_SW_HSE);
-    while (READ_BIT(RCC->CFGR, RCC_CFGR_SWS) != RCC_CFGR_SWS_HSE) {
-    }
-    SystemCoreClockUpdate();
-    (void)HAL_InitTick(TICK_INT_PRIORITY); /* 按 HSE_VALUE 重配 SysTick */
+    s_beep_until = HAL_GetTick() + ms;
+    s_beeping = true;
+    bsp_beep_set(true);
 }
 
-static void probe_lse(void)
+static void beep_poll(uint32_t now)
 {
-    SET_BIT(RCC->APB1ENR, RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN);
-    (void)READ_BIT(RCC->APB1ENR, RCC_APB1ENR_BKPEN); /* 等时钟使能生效 */
-    g_selftest.bdcr_initial = RCC->BDCR;
-
-    SET_BIT(PWR->CR, PWR_CR_DBP);
-    const uint32_t t0 = HAL_GetTick();
-    SET_BIT(RCC->BDCR, RCC_BDCR_LSEON);
-    while (READ_BIT(RCC->BDCR, RCC_BDCR_LSERDY) == 0u) {
-        if (HAL_GetTick() - t0 > LSE_STARTUP_TIMEOUT) {
-            break;
-        }
+    if (s_beeping && (int32_t)(now - s_beep_until) >= 0) {
+        s_beeping = false;
+        bsp_beep_set(false);
     }
-    if (READ_BIT(RCC->BDCR, RCC_BDCR_LSERDY) != 0u) {
-        g_selftest.lse_ready = 1u;
-        g_selftest.lse_wait_ms = HAL_GetTick() - t0;
-    }
-    /* RTC 已在跑（厂家程序配过）就做一次影子寄存器同步，主循环里读到的计数才可信 */
-    if (READ_BIT(RCC->BDCR, RCC_BDCR_RTCEN) != 0u) {
-        const uint32_t t1 = HAL_GetTick();
-        CLEAR_BIT(RTC->CRL, RTC_CRL_RSF);
-        while (READ_BIT(RTC->CRL, RTC_CRL_RSF) == 0u && HAL_GetTick() - t1 < 100u) {
-        }
-    }
-    CLEAR_BIT(PWR->CR, PWR_CR_DBP);
 }
 
-static void run_core_checks(void)
+static void print_status(void)
 {
-    for (uint32_t i = 0; i < SELFTEST_DATES; ++i) {
-        const mc_date_t d = k_dates[i];
-        mc_lunar_t lunar = {0};
-        const bool ok = mc_lunar_from_solar(d, &lunar);
+    bsp_dbg_puts("SYSCLK ");
+    bsp_dbg_put_u32(g_diag.sysclk_hz);
+    bsp_dbg_puts(" Hz, LCD ID 0x");
+    bsp_dbg_put_hex(g_diag.lcd_id, 4);
+    bsp_dbg_puts(", RTC ok=");
+    bsp_dbg_put_u32(g_diag.rtc_ok);
+    bsp_dbg_puts(" retained=");
+    bsp_dbg_put_u32(g_diag.rtc_retained);
+    bsp_dbg_puts(" time_set=");
+    bsp_dbg_put_u32(g_diag.rtc_time_set);
+    bsp_dbg_puts(" BDCR0=0x");
+    bsp_dbg_put_hex(g_diag.bdcr_initial, 8);
+    bsp_dbg_puts(" LSE ");
+    bsp_dbg_put_u32(g_diag.lse_wait_ms);
+    bsp_dbg_puts(" ms, sync ");
+    bsp_dbg_put_u32(g_diag.sync_state);
+    bsp_dbg_puts("\r\n");
+}
 
-        g_selftest.date[i].year = d.year;
-        g_selftest.date[i].month = d.month;
-        g_selftest.date[i].day = d.day;
-        g_selftest.date[i].days_from_epoch = mc_days_from_civil(d.year, d.month, d.day);
-        g_selftest.date[i].weekday = mc_weekday(d);
-        g_selftest.date[i].lunar_ok = ok;
-        g_selftest.date[i].lunar_year = lunar.year;
-        g_selftest.date[i].lunar_month = lunar.month;
-        g_selftest.date[i].lunar_day = lunar.day;
-        g_selftest.date[i].lunar_leap = lunar.is_leap;
+static void print_time(const mc_datetime_t *dt)
+{
+    char text[MC_DATETIME_TEXT_LEN + 1u];
+    mc_datetime_format(dt, text);
+    bsp_dbg_puts(text);
+    bsp_dbg_puts(" w");
+    bsp_dbg_put_u32(mc_weekday(dt->date)); /* 0 = 周日 */
+    bsp_dbg_puts("\r\n");
+}
+
+static void handle_command(const char *line, size_t len)
+{
+    if (len == 1u && line[0] == '?') {
+        print_status();
+        return;
     }
+    mc_datetime_t dt;
+    if (len >= 1u && line[0] == 'T' && mc_datetime_parse(line + 1, len - 1u, &dt)) {
+        if (port_rtc_set(&dt)) {
+            g_diag.rtc_time_set = 1u;
+            bsp_dbg_puts("OK set ");
+            print_time(&dt);
+        } else {
+            bsp_dbg_puts("ERR rtc write\r\n");
+        }
+        return;
+    }
+    bsp_dbg_puts("ERR usage: T2026-10-29 16:45:00 | ?\r\n");
+}
 
-    for (uint32_t i = 0; i < SELFTEST_TIMESTAMPS; ++i) {
-        uint32_t ts = 0;
-        g_selftest.ts[i].ok = mc_unix_from_local(&k_local_times[i], MC_TZ_BEIJING_S, &ts);
-        g_selftest.ts[i].ts = ts;
+/* 调试口按行收指令；超长的行整行丢弃，不截半截去执行 */
+static void poll_commands(void)
+{
+    static char line[CMD_MAX];
+    static size_t len;
+    static bool overflow;
+    int c;
+    while ((c = bsp_dbg_read_byte()) >= 0) {
+        if (c == '\r' || c == '\n') {
+            if (len > 0u && !overflow) {
+                handle_command(line, len);
+            }
+            len = 0;
+            overflow = false;
+        } else if (len < CMD_MAX) {
+            line[len++] = (char)c;
+        } else {
+            overflow = true;
+        }
+    }
+}
+
+static void on_key(bsp_key_t key, mc_key_event_t ev)
+{
+    if (ev != MC_KEY_EV_PRESS) {
+        return;
+    }
+    g_diag.key_press[key]++;
+    switch (key) {
+    case BSP_KEY0:
+        fw_beep(KEY_BEEP_MS);
+        bsp_dbg_puts("KEY0\r\n");
+        break;
+    case BSP_KEY1:
+        bsp_dbg_puts("KEY1 ");
+        print_status();
+        break;
+    case BSP_KEY_UP:
+        bsp_dbg_puts("KEY_UP: sync\r\n");
+        app_request_sync();
+        break;
+    default:
+        break;
     }
 }
 
 int main(void)
 {
-    HAL_Init(); /* SysTick 1 ms，此时还是复位后的 HSI；不配 PLL */
+    HAL_Init();
+    g_diag.magic = DIAG_MAGIC;
+    g_diag.version = DIAG_VERSION;
+    g_diag.clock_ok = bsp_clock_init();
+    g_diag.sysclk_hz = HAL_RCC_GetSysClockFreq();
 
-    g_selftest.magic = SELFTEST_MAGIC;
-    g_selftest.version = SELFTEST_VERSION;
-    probe_lse(); /* 先在 HSI 时基下测，等待时长的毫秒数才准 */
-    probe_hse();
-    g_selftest.sysclk_source = READ_BIT(RCC->CFGR, RCC_CFGR_SWS) >> RCC_CFGR_SWS_Pos;
-    g_selftest.sysclk_hz = HAL_RCC_GetSysClockFreq();
-    run_core_checks();
+    bsp_gpio_init();
+    bsp_uart_init();
+    bsp_dbg_puts("\r\nmcu-calendar fw\r\n");
 
-    mc_countdown_t countdown;
-    mc_countdown_set(&countdown, SELFTEST_COUNTDOWN_MS);
-    const uint32_t start = HAL_GetTick();
-    mc_countdown_start(&countdown, start);
-    g_selftest.countdown_start_ms = start;
-    g_selftest.done = SELFTEST_DONE;
+    bsp_lcd_init();
+    g_diag.lcd_id = bsp_lcd_read_id();
+
+    /* RTC 从没设过时间时的起点：2026-01-01 00:00:00 北京时间。看到这个日期就知道还没校过时 */
+    static const mc_datetime_t k_default = {{2026, 1, 1}, 0, 0, 0};
+    uint32_t default_s = 0;
+    (void)mc_unix_from_local(&k_default, MC_TZ_BEIJING_S, &default_s);
+    bsp_rtc_status_t rtc;
+    bsp_rtc_init(default_s, &rtc);
+    g_diag.rtc_ok = rtc.ok;
+    g_diag.rtc_retained = rtc.retained;
+    g_diag.rtc_time_set = rtc.time_set;
+    g_diag.bdcr_initial = rtc.bdcr_initial;
+    g_diag.lse_wait_ms = rtc.lse_wait_ms;
+    print_status();
+
+    app_init();
+
+    mc_key_t keys[BSP_KEY_COUNT];
+    for (uint8_t i = 0; i < BSP_KEY_COUNT; ++i) {
+        mc_key_init(&keys[i]);
+    }
+    uint32_t last_key_poll = HAL_GetTick();
+    uint32_t last_second = 0;
+    bool have_second = false;
 
     for (;;) {
         const uint32_t now = HAL_GetTick();
-        if (mc_countdown_poll(&countdown, now)) {
-            g_selftest.countdown_fired_ms = now;
-            g_selftest.countdown_fired = 1u;
+        app_poll();
+        poll_commands();
+        beep_poll(now);
+
+        if (now - last_key_poll >= KEY_POLL_MS) {
+            last_key_poll = now;
+            for (uint8_t i = 0; i < BSP_KEY_COUNT; ++i) {
+                const bsp_key_t key = (bsp_key_t)i;
+                on_key(key, mc_key_poll(&keys[i], bsp_key_pressed(key), now));
+            }
         }
-        g_selftest.tick_ms = now;
-        g_selftest.rtc_cnt = (RTC->CNTH << 16) | (RTC->CNTL & 0xFFFFu);
-        g_selftest.loops++;
+
+        uint32_t s;
+        if (g_diag.rtc_ok && bsp_rtc_read(&s) && (!have_second || s != last_second)) {
+            have_second = true;
+            last_second = s;
+            g_diag.rtc_seconds = s;
+            mc_datetime_t dt;
+            mc_local_from_unix(s, MC_TZ_BEIJING_S, &dt);
+            print_time(&dt);
+            bsp_led_toggle(0); /* DS0 每秒翻转：走时的心跳 */
+            if (dt.minute == 0u && dt.second == 0u) {
+                fw_beep(CHIME_BEEP_MS);
+            }
+        }
+
+        const app_sync_state_t sync = app_sync_state();
+        if (g_diag.sync_state != (uint32_t)sync) {
+            g_diag.sync_state = (uint32_t)sync;
+            bsp_dbg_puts("sync state ");
+            bsp_dbg_put_u32((uint32_t)sync);
+            bsp_dbg_puts("\r\n");
+        }
+        bsp_led_set(1, sync == APP_SYNC_RUNNING);
+        g_diag.esp_rx_dropped = bsp_esp_rx_dropped();
+        g_diag.tick_ms = now;
+        g_diag.loops++;
     }
 }

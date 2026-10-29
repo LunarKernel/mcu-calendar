@@ -12,7 +12,7 @@
 
 读取用 CubeProgrammer 的 HOTPLUG 模式：不复位、不停核，读的是运行中的内存。
 OpenOCD 同理：reset_config none 且不发 halt，init 只做 examine，内存经 AHB-AP 直接读。
-g_selftest 的布局见 firmware/src/main.c，两边改动要同步，并对上 SELFTEST_VERSION。
+g_selftest 的布局见 firmware/src/selftest_main.c，两边改动要同步，并对上 SELFTEST_VERSION。
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ HEADER_WORDS = 9
 DATE_WORDS = 10
 TS_WORDS = 2
 
-# 与 main.c 的 k_dates 同序
+# 与 selftest_main.c 的 k_dates 同序
 DATES = [(2026, 10, 27), (2000, 2, 29), (2020, 5, 23), (2033, 12, 22), (1901, 2, 19), (2100, 12, 31)]
 # (农历年, 月, 日, 是否闰月)，来源见文件头
 LUNAR_EXPECTED = [
@@ -50,7 +50,7 @@ LUNAR_EXPECTED = [
     (1901, 1, 1, False),
     (2100, 12, 1, False),
 ]
-# 与 main.c 的 k_local_times 同序，北京时间
+# 与 selftest_main.c 的 k_local_times 同序，北京时间
 LOCAL_TIMES = [
     (1970, 1, 1, 8, 0, 0),
     (2026, 10, 27, 0, 0, 0),
@@ -182,7 +182,7 @@ def main() -> int:
     args = ap.parse_args()
 
     build = args.build_dir.resolve()
-    elf = build / "firmware" / "mcu_calendar_fw.elf"
+    elf = build / "firmware" / "mcu_selftest_fw.elf"
     if not elf.is_file():
         sys.exit(f"没有 {elf}，先 cmake --build --preset firmware")
     nm = cache_value(build, "CMAKE_NM")

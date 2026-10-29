@@ -2,13 +2,15 @@
 
 CMake ＋ arm-none-eabi-gcc，Windows 与 macOS 用同一套命令。顶层 `CMakeLists.txt` 在交叉编译时把本目录加进来，链接的是 host 测试用的同一份 `mc_core`。
 
-## 现状（2026-10-28）
+## 现状（2026-10-29）
 
 - 芯片：经 SWD 读 DBGMCU_IDCODE 得 DEV_ID 0x414（F101/F103 大容量型，512 KB Flash）；10/28 丝印直读「STM32F103」，`MC_MCU` 默认改为 `STM32F103xE`。封装后缀丝印太淡未读出，板上引出 PF/PG，推断为 ZET6（144 脚），未直读。
-- 板卡：普中（PRECHIN）Z300。原理图未得，所以这一版仍**不碰任何 GPIO 与外设引脚**，只动 RCC 与备份域。
+- 板卡：普中（PRECHIN）Z300 V2.0。10/29 得到原理图（普中资料包，不入本仓库），引脚逐条直读进 `src/board.h`。
 - 时钟：HSE 起振，SYSCLK 切到 HSE（不经 PLL）；10/28 以 PC 时钟拟合测得 8.0006 MHz。LSE（32.768 kHz）起振用时约 2.9 s；LSE 频率未测。
-- 唯一的程序是上板自检（`src/main.c`）：`core/` 在目标上算日期、农历、时间戳，`mc_countdown` 由真实 SysTick 驱动，再加 HSE、LSE 探测；结果放在 RAM 里的 `g_selftest`，PC 端经 SWD 只读取回比对。10/27 版 41 项、10/28 版（version 2）44 项实测全过。
-- 这不是功能验收：没有显示、按键、RTC，选题表里没有一项功能因此算完成。
+- 两个固件目标：
+  - `mcu_calendar_fw`（`src/main.c`）：应用固件。板级底座是 72 MHz 时钟、调试串口 USART1、ESP 串口 USART3、片内 RTC、按键消抖、蜂鸣器，还有读屏 ID；`app/` 跑在主循环里。屏的初始化序列还没有出处，人机界面暂时走调试串口，用法写在 `src/main.c` 文件头。10/29 上板：`diag.py` 9 项全过（72 MHz、屏 ID 0xB509、RTC 与 PC 同步、主循环在跑）；现场看到 DS0 每秒闪、KEY0 按下蜂鸣器「嘀」、背光亮（屏未初始化，白屏）。
+  - `mcu_selftest_fw`（`src/selftest_main.c`）：上板自检。`core/` 在目标上算日期、农历、时间戳，`mc_countdown` 由真实 SysTick 驱动，再加 HSE、LSE 探测；结果放在 RAM 里的 `g_selftest`，PC 端经 SWD 只读取回比对。10/27 版 41 项、10/28 版（version 2）44 项实测全过。
+- 这些都不是功能验收：选题表里没有一项功能因此算完成。
 
 ## 工具
 
@@ -60,9 +62,17 @@ python firmware/scripts/selftest.py --flash
 
 PATH 里已有编译器时，前两行的 `firmware-local` 换成 `firmware`。
 
-产物在 `build/firmware/firmware/`：`.elf`（烧录与调试用）、`.hex`、`.bin`、`.map`。
+产物在 `build/firmware/firmware/`：每个目标一组 `.elf`（烧录与调试用）、`.hex`、`.bin`、`.map`。
 
-`selftest.py --flash` 会**擦除整片 Flash** 再写入、校验、复位，然后读 4 次 `g_selftest` 核对；不加 `--flash` 只读不写。`--log` 可把 CLI 原始输出存档。
+应用固件的底座核对（只插 ST-Link 即可，经 SWD 读 `g_diag`）：
+
+```
+python3 firmware/scripts/diag.py --probe openocd --flash
+```
+
+核时钟 72 MHz、屏 ID 0xB509、RTC 秒数与 PC 同步、主循环在跑。同样会擦除整片 Flash。
+
+`selftest.py --flash` 烧的是 `mcu_selftest_fw`，会**擦除整片 Flash** 再写入、校验、复位，然后读 4 次 `g_selftest` 核对；不加 `--flash` 只读不写。`--log` 可把 CLI 原始输出存档。
 
 改了工具链文件 `cmake/arm-none-eabi.cmake` 之后要删掉 `build/firmware` 重新配置：里面的 `*_INIT` 变量只在首次配置时生效。
 

@@ -17,7 +17,7 @@ extern "C" {
 /* 单调毫秒时基，SysTick 1 ms 累加即可（HAL_GetTick 满足） */
 uint32_t port_millis(void);
 
-/* RTC（DS3231）读写本地时间；I2C 失败返回 false */
+/* RTC 读写本地时间（Z300 上是片内 RTC，见 firmware/src/port_impl.c）；失败返回 false */
 bool port_rtc_get(mc_datetime_t *out);
 bool port_rtc_set(const mc_datetime_t *dt);
 
