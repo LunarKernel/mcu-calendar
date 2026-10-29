@@ -85,6 +85,8 @@ mc_add_firmware(mcu_calendar_fw
     src/bsp_uart.c
     src/bsp_rtc.c
     src/bsp_lcd.c
+    src/gfx.c
+    src/ui.c
     src/port_impl.c
     ${PROJECT_SOURCE_DIR}/app/app.c
 )

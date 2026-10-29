@@ -45,8 +45,14 @@ void bsp_rtc_init(uint32_t default_s, bsp_rtc_status_t *st);
 bool bsp_rtc_read(uint32_t *seconds);
 bool bsp_rtc_write(uint32_t seconds); /* 同时置「时间已设」标记 */
 
-/* 屏：只配好 FSMC 与背光，读控制器 ID。R61509V 应读出 0xB509 */
+/* 屏 R61509VE，横屏 400×240，RGB565。
+ * bsp_lcd_init 配好 FSMC，之后 bsp_lcd_read_id 应读出 0xB509；bsp_lcd_panel_init 写初始化序列并开显示。
+ * bsp_lcd_fill 坐标含两端，越界整块不画 */
+#define BSP_LCD_W 400u
+#define BSP_LCD_H 240u
 void bsp_lcd_init(void);
 uint16_t bsp_lcd_read_id(void);
+void bsp_lcd_panel_init(void);
+void bsp_lcd_fill(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color);
 
 #endif

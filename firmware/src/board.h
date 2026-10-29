@@ -33,7 +33,8 @@
  * 16 位宽时 FSMC 地址线 A[n] 对应 HADDR[n+1]，所以 RS＝1 的地址是 bank 基址加 1 << 11。 */
 #define BOARD_LCD_CMD_ADDR 0x6C000000u
 #define BOARD_LCD_DATA_ADDR (0x6C000000u | (1u << 11))
-/* 背光 LCD_BL 直接接屏座，高电平亮（10/29 上板实测） */
+/* 背光 LCD_BL 接屏座第 3 脚。普中 TFT2.6-R61509VE 模块原理图上该脚悬空，背光由 R8 接 3.3 V 常亮，
+ * 所以这块屏上 PB0 不起作用；换别的模块时再看 */
 #define BOARD_LCD_BL_PORT GPIOB
 #define BOARD_LCD_BL_PIN GPIO_PIN_0
 

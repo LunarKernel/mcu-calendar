@@ -1,13 +1,15 @@
 /* 应用固件：板级初始化后把 app/ 跑在主循环里。
  *
- * 这一版（板级底座）能做的：72 MHz 时钟、两路串口、片内 RTC 走时、按键与蜂鸣器、读屏 ID；
- * 屏还没有初始化序列，所以人机界面暂时走调试串口（USART1，115200 8N1，经 USB2 的 CH340）：
+ * 能做的：72 MHz 时钟、两路串口、片内 RTC 走时、按键与蜂鸣器；屏上显示时钟主界面
+ * （日期星期、大号时分秒、Unix 时间戳、数字形式的农历、RTC 与校时状态，见 ui.c）。
+ * 屏上还没有设置界面，校时走调试串口（USART1，115200 8N1，经 USB2 的 CH340）：
  *   - 每秒打印一行本地时间；整点响一声（基本功能 2 的报时）；
  *   - 收到「T2026-10-29 16:45:00」一行即校时，PC 上可以 `date "+T%Y-%m-%d %H:%M:%S"` 发过来；
  *   - 收到「?」打印一次状态。
  * 按键：KEY0 短鸣一声，KEY1 打印状态，KEY_UP 发起网络校时（app_request_sync）。
  *
- * 另有 g_diag 放在 RAM 里，只插 ST-Link、不接串口时，也能经 SWD 只读取回看状态。 */
+ * 另有 g_diag 放在 RAM 里，只插 ST-Link、不接串口时，也能经 SWD 只读取回看状态；
+ * 往 g_set_unix 写一个非零的 UTC 秒数（diag.py --set-time），主循环会拿它校时，同样不必接串口。 */
 #include <stdint.h>
 
 #include "app.h"
@@ -15,6 +17,7 @@
 #include "fw.h"
 #include "port.h"
 #include "stm32f1xx_hal.h"
+#include "ui.h"
 
 #include "mc/mc_date.h"
 #include "mc/mc_key.h"
@@ -26,6 +29,7 @@
 #define KEY_BEEP_MS 40u
 #define CHIME_BEEP_MS 500u
 #define CMD_MAX 32u
+#define LCD_ID_R61509V 0xB509u
 
 /* 只由 32 位字组成，SWD 读回按字解析；布局改了要加 DIAG_VERSION */
 typedef struct {
@@ -48,6 +52,8 @@ typedef struct {
 } fw_diag_t;
 
 volatile fw_diag_t g_diag;
+/* 调试器写入的校时请求，0 表示没有。32 位对齐的单字写是原子的，主循环读到即清 */
+volatile uint32_t g_set_unix;
 
 static bool s_beeping;
 static uint32_t s_beep_until;
@@ -178,6 +184,12 @@ int main(void)
 
     bsp_lcd_init();
     g_diag.lcd_id = bsp_lcd_read_id();
+    /* ID 不对说明接线或屏型号不符，不往一个认不出的控制器里写初始化序列 */
+    const bool lcd_ok = g_diag.lcd_id == LCD_ID_R61509V;
+    if (lcd_ok) {
+        bsp_lcd_panel_init();
+        ui_clock_init();
+    }
 
     /* RTC 从没设过时间时的起点：2026-01-01 00:00:00 北京时间。看到这个日期就知道还没校过时 */
     static const mc_datetime_t k_default = {{2026, 1, 1}, 0, 0, 0};
@@ -206,6 +218,14 @@ int main(void)
         const uint32_t now = HAL_GetTick();
         app_poll();
         poll_commands();
+        if (g_set_unix != 0u) {
+            const uint32_t req = g_set_unix;
+            g_set_unix = 0;
+            if (bsp_rtc_write(req)) {
+                g_diag.rtc_time_set = 1u;
+                bsp_dbg_puts("OK set by debugger\r\n");
+            }
+        }
         beep_poll(now);
 
         if (now - last_key_poll >= KEY_POLL_MS) {
@@ -227,6 +247,11 @@ int main(void)
             bsp_led_toggle(0); /* DS0 每秒翻转：走时的心跳 */
             if (dt.minute == 0u && dt.second == 0u) {
                 fw_beep(CHIME_BEEP_MS);
+            }
+            if (lcd_ok) {
+                const ui_clock_t view = {dt, s, g_diag.rtc_ok != 0u, g_diag.rtc_time_set != 0u,
+                                         (uint8_t)app_sync_state()};
+                ui_clock_show(&view);
             }
         }
 

@@ -3,6 +3,7 @@
 
     python3 firmware/scripts/diag.py --probe openocd --flash   # 擦除整片 Flash、烧录、复位，再核对
     python3 firmware/scripts/diag.py --probe openocd           # 只读，不写板子
+    python3 firmware/scripts/diag.py --probe openocd --set-time  # 把 PC 当前时间写进板上 RTC（只写 RAM 里一个字）
 
 只插 ST-Link、不接调试串口也能用。核的是「底座通了」，不是任何一项选题功能的验收：
   - 时钟：clock_ok＝1，SYSCLK＝72 MHz（HSE 8 MHz × 9）；
@@ -21,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from selftest import (REPO, Checker, cache_value, find_cli, find_openocd, flash,  # noqa: E402
-                      read_words, symbol_address)
+                      read_words, run_cli, run_openocd, symbol_address)
 
 MAGIC = 0x4D434631
 VERSION = 1
@@ -44,6 +45,8 @@ def main() -> int:
     ap.add_argument("--cli", help="STM32_Programmer_CLI 路径（--probe cubeprog）")
     ap.add_argument("--openocd", help="openocd 路径（--probe openocd）")
     ap.add_argument("--flash", action="store_true", help="先擦除整片 Flash 并烧录、复位")
+    ap.add_argument("--set-time", action="store_true",
+                    help="经 SWD 往 g_set_unix 写 PC 当前 UTC 秒数，固件主循环据此校时（不写 Flash）")
     ap.add_argument("--interval", type=float, default=10.0, help="两次读取之间的秒数")
     ap.add_argument("--log", type=Path, help="把 CLI 原始输出与核对结果存到这个文件")
     args = ap.parse_args()
@@ -62,6 +65,16 @@ def main() -> int:
         print("擦除整片 Flash、烧录、校验、复位 ...")
         flash(args.probe, tool, elf, log)
         time.sleep(LSE_TIMEOUT_MS / 1000 + 1.0)
+
+    if args.set_time:
+        set_addr = symbol_address(nm, elf, "g_set_unix")
+        now = int(time.time()) + 1  # 写进去时已过去小半秒，取下一整秒更接近
+        if args.probe == "openocd":
+            run_openocd(tool, [f"mww 0x{set_addr:08X} 0x{now:08X}"], log)
+        else:
+            run_cli(tool, ["-c", "port=SWD", "mode=HOTPLUG", "-w32", f"0x{set_addr:08X}", f"0x{now:08X}"], log)
+        print(f"已写 g_set_unix = {now}")
+        time.sleep(1.0)
 
     a, ta = read_diag(args.probe, tool, addr, log)
     time.sleep(args.interval)
@@ -86,6 +99,10 @@ def main() -> int:
     tick_dt = (b["tick_ms"] - a["tick_ms"]) & 0xFFFFFFFF
     c.check(f"tick 增量 {tick_dt} ms ≈ PC {pc_dt * 1000:.0f} ms（±2%）", abs(tick_dt - pc_dt * 1000) <= pc_dt * 20, True)
     c.check("主循环在跑", b["loops"] != a["loops"], True)
+    if args.set_time:
+        drift = b["rtc_seconds"] - time.time()
+        c.check(f"RTC 与 PC 时间差 {drift:+.1f} s（±2）", abs(drift) <= 2.0, True)
+        c.check("rtc_time_set", b["rtc_time_set"], 1)
     print(f"合计：{c.passed} 项通过，{c.failed} 项失败")
 
     if args.log:
