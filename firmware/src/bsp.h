@@ -44,6 +44,7 @@ typedef struct {
 void bsp_rtc_init(uint32_t default_s, bsp_rtc_status_t *st);
 bool bsp_rtc_read(uint32_t *seconds);
 bool bsp_rtc_write(uint32_t seconds); /* 同时置「时间已设」标记 */
+bool bsp_rtc_time_set(void); /* 读备份寄存器里的标记；不论经哪条路写的 RTC 都认 */
 
 /* 屏 R61509VE，横屏 400×240，RGB565。
  * bsp_lcd_init 配好 FSMC，之后 bsp_lcd_read_id 应读出 0xB509；bsp_lcd_panel_init 写初始化序列并开显示。

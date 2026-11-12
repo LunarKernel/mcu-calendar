@@ -30,6 +30,7 @@ static int32_t s_day = -1; /* 按 1970 起的天数记，日期变了才重画�
 static uint32_t s_unix;
 static bool s_unix_drawn;
 static int s_status = -1;
+static bool s_digits_set; /* 上次画数字时的 time_set：变了要整组重画，否则没变的那几位留着旧颜色 */
 
 static uint16_t digit_x(uint8_t i)
 {
@@ -138,6 +139,10 @@ void ui_clock_show(const ui_clock_t *st)
 
     const uint8_t d[6] = {(uint8_t)(t->hour / 10u), (uint8_t)(t->hour % 10u),     (uint8_t)(t->minute / 10u),
                           (uint8_t)(t->minute % 10u), (uint8_t)(t->second / 10u), (uint8_t)(t->second % 10u)};
+    if (st->time_set != s_digits_set) {
+        s_digits_set = st->time_set;
+        memset(s_digits, 0xFF, sizeof s_digits);
+    }
     for (uint8_t i = 0; i < 6u; ++i) {
         if (d[i] != s_digits[i]) {
             s_digits[i] = d[i];
@@ -169,5 +174,97 @@ void ui_clock_show(const ui_clock_t *st)
         }
         *p = '\0';
         draw_line(STATUS_Y, buf, 2, st->rtc_ok && st->time_set ? GFX_GREEN : GFX_RED, false);
+    }
+}
+
+/* ---- 时间设置界面 ---- */
+
+#define SET_SCALE 5u
+#define SET_CH_W (6u * SET_SCALE)
+#define SET_DATE_X ((BSP_LCD_W - 10u * SET_CH_W) / 2u)
+#define SET_DATE_Y 56u
+#define SET_TIME_X ((BSP_LCD_W - 8u * SET_CH_W) / 2u)
+#define SET_TIME_Y 118u
+
+void ui_set_init(void)
+{
+    bsp_lcd_fill(0, 0, (uint16_t)(BSP_LCD_W - 1u), (uint16_t)(BSP_LCD_H - 1u), BG);
+    draw_line(8, "SET TIME", 3, GFX_YELLOW, true);
+    draw_line(190, "UP +   K0 -   K1 NEXT", 2, GFX_GRAY, false);
+    draw_line(214, "HOLD K1 SAVE   30S IDLE CANCEL", 2, GFX_GRAY, false);
+}
+
+/* 画一个字段（n 位数字）加它后面的分隔符；选中的字段反色 */
+static uint16_t set_field(uint16_t x, uint16_t y, uint32_t v, uint8_t n, bool selected, const char *sep)
+{
+    char buf[5];
+    *put_num(buf, v, n) = '\0';
+    x = gfx_text(x, y, buf, SET_SCALE, selected ? GFX_BLACK : GFX_WHITE, selected ? GFX_YELLOW : BG);
+    return gfx_text(x, y, sep, SET_SCALE, GFX_WHITE, BG);
+}
+
+void ui_set_show(const mc_edit_t *e)
+{
+    const mc_datetime_t *t = &e->dt;
+    uint16_t x = (uint16_t)SET_DATE_X;
+    x = set_field(x, SET_DATE_Y, (uint32_t)t->date.year, 4, e->field == MC_EDIT_YEAR, "-");
+    x = set_field(x, SET_DATE_Y, t->date.month, 2, e->field == MC_EDIT_MONTH, "-");
+    (void)set_field(x, SET_DATE_Y, t->date.day, 2, e->field == MC_EDIT_DAY, "");
+    x = (uint16_t)SET_TIME_X;
+    x = set_field(x, SET_TIME_Y, t->hour, 2, e->field == MC_EDIT_HOUR, ":");
+    x = set_field(x, SET_TIME_Y, t->minute, 2, e->field == MC_EDIT_MINUTE, ":");
+    (void)set_field(x, SET_TIME_Y, t->second, 2, e->field == MC_EDIT_SECOND, "");
+}
+
+/* ---- 万年历月视图 ---- */
+
+#define CAL_CELL_W 56u
+#define CAL_CELL_H 31u
+#define CAL_X0 4u
+#define CAL_HEAD_Y 26u
+#define CAL_GRID_Y 48u
+
+void ui_cal_show(const mc_calview_t *v, mc_date_t today)
+{
+    static const char *const k_head[7] = {"SU", "MO", "TU", "WE", "TH", "FR", "SA"};
+    bsp_lcd_fill(0, 0, (uint16_t)(BSP_LCD_W - 1u), (uint16_t)(BSP_LCD_H - 1u), BG);
+
+    char buf[8];
+    char *p = put_num(buf, (uint32_t)v->year, 4);
+    *p++ = '-';
+    p = put_num(p, v->month, 2);
+    *p = '\0';
+    uint16_t x = gfx_text(8, 4, buf, 2, GFX_YELLOW, BG);
+    (void)gfx_text((uint16_t)(x + 24u), 4, "UP/K0 MONTH  HOLD YEAR", 2, GFX_GRAY, BG);
+
+    const uint16_t text_dx = (uint16_t)((CAL_CELL_W - 2u * 12u) / 2u);
+    for (uint8_t c = 0; c < 7u; ++c) {
+        const uint16_t fg = (c == 0u || c == 6u) ? GFX_RED : GFX_CYAN;
+        (void)gfx_text((uint16_t)(CAL_X0 + c * CAL_CELL_W + text_dx), CAL_HEAD_Y, k_head[c], 2, fg, BG);
+    }
+
+    uint8_t grid[42];
+    mc_calview_fill_grid(v, grid);
+    const bool this_month = today.year == v->year && today.month == v->month;
+    for (uint8_t i = 0; i < 42u; ++i) {
+        if (grid[i] == 0u) {
+            continue;
+        }
+        const uint8_t c = (uint8_t)(i % 7u);
+        const uint16_t cx = (uint16_t)(CAL_X0 + c * CAL_CELL_W);
+        const uint16_t cy = (uint16_t)(CAL_GRID_Y + (i / 7u) * CAL_CELL_H);
+        const bool is_today = this_month && grid[i] == today.day;
+        uint16_t fg = (c == 0u || c == 6u) ? GFX_RED : GFX_WHITE;
+        uint16_t bg = BG;
+        if (is_today) { /* 今天：整格反色 */
+            fg = GFX_BLACK;
+            bg = GFX_CYAN;
+            bsp_lcd_fill(cx, cy, (uint16_t)(cx + CAL_CELL_W - 3u), (uint16_t)(cy + CAL_CELL_H - 3u), bg);
+        }
+        char num[3];
+        num[0] = grid[i] >= 10u ? (char)('0' + grid[i] / 10u) : ' ';
+        num[1] = (char)('0' + grid[i] % 10u);
+        num[2] = '\0';
+        (void)gfx_text((uint16_t)(cx + text_dx), (uint16_t)(cy + 6u), num, 2, fg, bg);
     }
 }

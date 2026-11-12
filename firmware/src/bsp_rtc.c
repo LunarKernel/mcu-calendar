@@ -127,3 +127,8 @@ bool bsp_rtc_write(uint32_t seconds)
     BKP->DR1 = TIME_SET_MAGIC;
     return true;
 }
+
+bool bsp_rtc_time_set(void)
+{
+    return (BKP->DR1 & 0xFFFFu) == TIME_SET_MAGIC;
+}

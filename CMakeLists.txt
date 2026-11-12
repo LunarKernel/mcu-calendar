@@ -23,6 +23,7 @@ add_library(mc_core STATIC
     core/src/mc_pomodoro.c
     core/src/mc_key.c
     core/src/mc_text.c
+    core/src/mc_edit.c
 )
 target_include_directories(mc_core PUBLIC core/include)
 
@@ -37,7 +38,7 @@ target_link_libraries(lunar_dump PRIVATE mc_core)
 
 include(CTest)
 if(BUILD_TESTING)
-    foreach(name date lunar timers sntp alarm pomodoro key text)
+    foreach(name date lunar timers sntp alarm pomodoro key text edit)
         add_executable(test_${name} tests/test_${name}.c)
         target_link_libraries(test_${name} PRIVATE mc_core)
         add_test(NAME ${name} COMMAND test_${name})

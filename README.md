@@ -16,7 +16,7 @@
 |---|---|---|---|---|
 | 基本 4 · 32 位时间戳 | 5 | A | `core/src/mc_date.c` | 算法完成，host 已测 |
 | 扩展 1 · 农历 | 5 | A | `core/src/mc_lunar.c` | 算法完成，全范围已核对 |
-| 扩展 2 · 万年历 1900–2099 | 5 | A | `core/src/mc_calview.c` ＋ `mc_date.c` | 算法完成，host 已测；界面未做 |
+| 扩展 2 · 万年历 1900–2099 | 5 | A | `core/src/mc_calview.c` ＋ `mc_date.c` | 算法完成，host 已测；月视图翻页界面 11/12 写成（`firmware/src/ui.c`） |
 | 扩展 3 · 多秒表多定时 | 5 | A | `core/src/mc_timers.c` | 状态机完成，host 已测；界面未做 |
 | 扩展 5 · ESP8266 网络校时 | 5 | A | `core/src/mc_sntp.c` ＋ `app/app.c` | 状态机完成，对脚本化应答已测；**未接真模块** |
 | 整体软件框架 | — | A | `app/` | 骨架与中断分层约定已定 |
@@ -58,7 +58,7 @@ A 的代码只调用 `app/port.h` 里的六个函数，B 的驱动只需要实�
 本机 PATH 里不需要有 cmake / ninja / cl，脚本借 Visual Studio 自带的那一套（需装「使用 C++ 的桌面开发」与「用于 Windows 的 C++ CMake 工具」）：
 
 ```powershell
-.\scripts\host-test.ps1        # 配置、编译（/W4 /WX）、跑 9 组测试
+.\scripts\host-test.ps1        # 配置、编译（/W4 /WX）、跑 10 组测试
 .\tools\verify_lunar.ps1       # 农历查表 vs .NET ChineseLunisolarCalendar 逐日比对
 ```
 
