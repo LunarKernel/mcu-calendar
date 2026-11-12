@@ -2,11 +2,17 @@
  *
  * 能做的：72 MHz 时钟、两路串口、片内 RTC 走时、按键与蜂鸣器；屏上显示时钟主界面
  * （日期星期、大号时分秒、Unix 时间戳、数字形式的农历、RTC 与校时状态，见 ui.c）。
- * 三个界面，按键（短按在松开时生效，长按 0.8 s）：
- *   时钟：KEY1 短按进万年历，KEY1 长按进时间设置，KEY_UP 长按发起网络校时；
+ * 六个界面，KEY1 短按依次轮转：时钟 → 万年历 → 闹钟 → 番茄钟 → 多路计时 → 时钟。
+ * 按键（短按在松开时生效，长按 0.8 s）：
+ *   时钟：KEY1 长按进时间设置，KEY_UP 长按发起网络校时；
  *   设置：KEY_UP 加、KEY0 减（按住连发），KEY1 短按换字段，KEY1 长按保存并返回；30 s 不动放弃修改；
- *   万年历：KEY_UP 下一月、KEY0 上一月，按住则按年翻（连发），KEY1 短按返回。
- * 整点响一声（基本功能 2 的报时），在哪个界面都响。
+ *   万年历：KEY_UP 下一月、KEY0 上一月，按住则按年翻（连发）；
+ *   闹钟：KEY0 换字段（时、分、重复方式、开关），KEY_UP 改选中的字段（时分按住连发），改完即生效；
+ *   番茄钟：KEY_UP 开始／暂停，KEY0 停止归零，KEY0 长按在 25/5 与 1/1 分钟两组时长间切换；
+ *   多路计时：四路秒表加四路倒计时。KEY0 选下一路；KEY_UP 启停；
+ *             KEY_UP 长按：秒表清零，倒计时换时长（1、3、5、10 分钟）并复位。
+ * 闹钟、番茄钟、倒计时、整点报时在哪个界面都照常走、照常响。闹钟响时跳到闹钟界面，按任意键止闹。
+ * 闹钟设定存在备份寄存器里，和 RTC 一样靠 VBAT 才跨断电保持。
  * 调试串口（USART1，115200 8N1，经 USB2 的 CH340）：
  *   - 每秒打印一行本地时间；
  *   - 收到「T2026-10-29 16:45:00」一行即校时，PC 上可以 `date "+T%Y-%m-%d %H:%M:%S"` 发过来；
@@ -24,9 +30,11 @@
 #include "ui.h"
 
 #include "mc/mc_calview.h"
+#include "mc/mc_alarm.h"
 #include "mc/mc_date.h"
 #include "mc/mc_edit.h"
 #include "mc/mc_key.h"
+#include "mc/mc_pomodoro.h"
 #include "mc/mc_text.h"
 
 #define DIAG_MAGIC 0x4D434631u /* "MCF1" */
@@ -36,6 +44,11 @@
 #define KEY_REPEAT_MS 150u
 #define SAVE_BEEP_MS 120u
 #define SET_IDLE_TIMEOUT_MS 30000u
+#define LIVE_REFRESH_MS 100u
+#define ALARM_RING_BEEPS 60u /* 250 ms 响、250 ms 停，共 30 s */
+#define ALARM_RING_MS 250u
+#define ALARM_BKP_MAGIC 0xA500u
+#define MIN_MS 60000u
 #define CHIME_BEEP_MS 500u
 #define CMD_MAX 32u
 #define LCD_ID_R61509V 0xB509u
@@ -64,21 +77,45 @@ volatile fw_diag_t g_diag;
 /* 调试器写入的校时请求，0 表示没有。32 位对齐的单字写是原子的，主循环读到即清 */
 volatile uint32_t g_set_unix;
 
-static bool s_beeping;
-static uint32_t s_beep_until;
+/* 蜂鸣器节拍：left 是还没响完的声数（含正在响的这一声） */
+static struct {
+    uint8_t left;
+    bool on;
+    uint32_t until;
+    uint32_t on_ms;
+    uint32_t off_ms;
+} s_beep;
+
+void fw_beep_pattern(uint8_t count, uint32_t on_ms, uint32_t off_ms)
+{
+    s_beep.left = count;
+    s_beep.on_ms = on_ms;
+    s_beep.off_ms = off_ms;
+    s_beep.on = count > 0u;
+    s_beep.until = HAL_GetTick() + on_ms;
+    bsp_beep_set(s_beep.on);
+}
 
 void fw_beep(uint32_t ms)
 {
-    s_beep_until = HAL_GetTick() + ms;
-    s_beeping = true;
-    bsp_beep_set(true);
+    fw_beep_pattern(1, ms, 0);
 }
 
 static void beep_poll(uint32_t now)
 {
-    if (s_beeping && (int32_t)(now - s_beep_until) >= 0) {
-        s_beeping = false;
+    if (s_beep.left == 0u || (int32_t)(now - s_beep.until) < 0) {
+        return;
+    }
+    if (s_beep.on) {
         bsp_beep_set(false);
+        s_beep.on = false;
+        if (--s_beep.left > 0u) {
+            s_beep.until += s_beep.off_ms; /* 从期限起算，节拍不随轮询迟到而拖长 */
+        }
+    } else {
+        bsp_beep_set(true);
+        s_beep.on = true;
+        s_beep.until += s_beep.on_ms;
     }
 }
 
@@ -155,7 +192,7 @@ static void poll_commands(void)
     }
 }
 
-typedef enum { FW_MODE_CLOCK, FW_MODE_SET, FW_MODE_CAL } fw_mode_t;
+typedef enum { FW_MODE_CLOCK, FW_MODE_SET, FW_MODE_CAL, FW_MODE_ALARM, FW_MODE_POMO, FW_MODE_TIMERS } fw_mode_t;
 typedef enum { KEY_ACT_CLICK, KEY_ACT_LONG, KEY_ACT_REPEAT } key_act_t;
 
 static bool s_lcd_ok;
@@ -165,6 +202,42 @@ static mc_calview_t s_cal;
 static uint32_t s_set_touch_ms; /* 设置界面最后一次按键的时刻 */
 static mc_datetime_t s_now;     /* 最近一次读到的本地时间；RTC 不可用时保持全零（非法日期） */
 static uint32_t s_now_unix;
+
+static mc_alarm_t s_alarm;
+static ui_alarm_field_t s_alarm_field;
+static bool s_ringing;
+static bool s_swallow[BSP_KEY_COUNT]; /* 止闹用掉的那次按键，松开前不再算短按或长按 */
+static mc_pomodoro_t s_pomo;
+static uint8_t s_timer_sel; /* 0–3 秒表，4–7 倒计时 */
+
+/* 闹钟设定 ↔ 备份寄存器：DR2 = 时<<8 | 分，DR3 = 0xA5 标记<<8 | 开关<<7 | 星期位图 */
+static void alarm_save(void)
+{
+    bsp_bkp_write(0, (uint16_t)((uint16_t)(s_alarm.hour << 8) | s_alarm.minute));
+    bsp_bkp_write(1, (uint16_t)(ALARM_BKP_MAGIC | (s_alarm.enabled ? 0x80u : 0u) | s_alarm.weekdays));
+}
+
+static void alarm_apply(uint8_t hour, uint8_t minute, uint8_t weekdays, bool enabled)
+{
+    if (!mc_alarm_set(&s_alarm, hour, minute, weekdays)) {
+        return;
+    }
+    if (!enabled) {
+        mc_alarm_disable(&s_alarm);
+    }
+}
+
+static void alarm_load(void)
+{
+    mc_alarm_init(&s_alarm);
+    alarm_apply(7, 0, MC_ALARM_ONCE, false); /* 没存过时的默认：07:00 单次、关 */
+    const uint16_t hm = bsp_bkp_read(0);
+    const uint16_t cfg = bsp_bkp_read(1);
+    if ((cfg & 0xFF00u) == ALARM_BKP_MAGIC) {
+        /* 存的值不合法时 mc_alarm_set 拒收，保持默认 */
+        alarm_apply((uint8_t)(hm >> 8), (uint8_t)(hm & 0xFFu), (uint8_t)(cfg & 0x7Fu), (cfg & 0x80u) != 0u);
+    }
+}
 
 static void draw_clock(void)
 {
@@ -192,6 +265,18 @@ static void enter_mode(fw_mode_t mode, uint32_t now)
         mc_calview_init(&s_cal, s_now.date.year, s_now.date.month);
         ui_cal_show(&s_cal, s_now.date);
         break;
+    case FW_MODE_ALARM:
+        ui_alarm_init();
+        ui_alarm_show(&s_alarm, s_alarm_field, s_ringing);
+        break;
+    case FW_MODE_POMO:
+        ui_pomo_init();
+        ui_pomo_show(&s_pomo, now);
+        break;
+    case FW_MODE_TIMERS:
+        ui_timers_init();
+        ui_timers_show(app_timers(), s_timer_sel, now);
+        break;
     default:
         ui_clock_init();
         draw_clock();
@@ -201,9 +286,7 @@ static void enter_mode(fw_mode_t mode, uint32_t now)
 
 static void act_clock(bsp_key_t key, key_act_t act, uint32_t now)
 {
-    if (key == BSP_KEY1 && act == KEY_ACT_CLICK) {
-        enter_mode(FW_MODE_CAL, now);
-    } else if (key == BSP_KEY1 && act == KEY_ACT_LONG) {
+    if (key == BSP_KEY1 && act == KEY_ACT_LONG) {
         fw_beep(KEY_BEEP_MS);
         enter_mode(FW_MODE_SET, now);
     } else if (key == BSP_KEY_UP && act == KEY_ACT_LONG) {
@@ -242,10 +325,8 @@ static void act_set(bsp_key_t key, key_act_t act, uint32_t now)
 
 static void act_cal(bsp_key_t key, key_act_t act, uint32_t now)
 {
+    (void)now;
     if (key == BSP_KEY1) {
-        if (act == KEY_ACT_CLICK) {
-            enter_mode(FW_MODE_CLOCK, now);
-        }
         return;
     }
     const int32_t dir = key == BSP_KEY_UP ? 1 : -1;
@@ -256,14 +337,134 @@ static void act_cal(bsp_key_t key, key_act_t act, uint32_t now)
     }
 }
 
+static void act_alarm(bsp_key_t key, key_act_t act)
+{
+    if (key == BSP_KEY0 && act == KEY_ACT_CLICK) {
+        s_alarm_field = (ui_alarm_field_t)(((int)s_alarm_field + 1) % (int)UI_ALARM_FIELDS);
+    } else if (key == BSP_KEY_UP) {
+        uint8_t hour = s_alarm.hour;
+        uint8_t minute = s_alarm.minute;
+        uint8_t weekdays = s_alarm.weekdays;
+        bool enabled = s_alarm.enabled;
+        switch (s_alarm_field) {
+        case UI_ALARM_HOUR:
+            hour = (uint8_t)((hour + 1u) % 24u);
+            break;
+        case UI_ALARM_MINUTE:
+            minute = (uint8_t)((minute + 1u) % 60u);
+            break;
+        case UI_ALARM_MODE:
+            if (act != KEY_ACT_CLICK) { /* 重复方式与开关只认短按，按住不连翻 */
+                return;
+            }
+            weekdays = weekdays == MC_ALARM_ONCE       ? MC_ALARM_EVERYDAY
+                       : weekdays == MC_ALARM_EVERYDAY ? UI_ALARM_WORKDAYS
+                                                       : MC_ALARM_ONCE;
+            break;
+        default:
+            if (act != KEY_ACT_CLICK) {
+                return;
+            }
+            enabled = !enabled;
+            break;
+        }
+        /* 重新设定会清掉「今天已响」：改完若正好是当前这一分钟，会立刻再响一次（演示「设 1 min」靠这个） */
+        alarm_apply(hour, minute, weekdays, enabled);
+        alarm_save();
+    } else {
+        return;
+    }
+    if (s_lcd_ok) {
+        ui_alarm_show(&s_alarm, s_alarm_field, s_ringing);
+    }
+}
+
+static void act_pomo(bsp_key_t key, key_act_t act, uint32_t now)
+{
+    if (key == BSP_KEY_UP && act == KEY_ACT_CLICK) {
+        if (s_pomo.running) {
+            mc_pomodoro_pause(&s_pomo, now);
+        } else {
+            mc_pomodoro_start(&s_pomo, now);
+        }
+    } else if (key == BSP_KEY0 && act == KEY_ACT_CLICK) {
+        mc_pomodoro_stop(&s_pomo);
+    } else if (key == BSP_KEY0 && act == KEY_ACT_LONG) {
+        /* 换时长即重新初始化：回到 IDLE、计数清零 */
+        const bool demo = s_pomo.work_ms != 1u * MIN_MS;
+        (void)mc_pomodoro_init(&s_pomo, demo ? 1u * MIN_MS : MC_POMODORO_WORK_MS_DEFAULT,
+                               demo ? 1u * MIN_MS : MC_POMODORO_BREAK_MS_DEFAULT);
+        fw_beep(KEY_BEEP_MS);
+    }
+}
+
+static void act_timers(bsp_key_t key, key_act_t act, uint32_t now)
+{
+    mc_timer_bank_t *bank = app_timers();
+    if (key == BSP_KEY0 && act == KEY_ACT_CLICK) {
+        s_timer_sel = (uint8_t)((s_timer_sel + 1u) % (MC_STOPWATCH_CHANNELS + MC_COUNTDOWN_CHANNELS));
+        return;
+    }
+    if (key != BSP_KEY_UP || act == KEY_ACT_REPEAT) {
+        return;
+    }
+    if (s_timer_sel < MC_STOPWATCH_CHANNELS) {
+        mc_stopwatch_t *sw = &bank->stopwatch[s_timer_sel];
+        if (act == KEY_ACT_LONG) {
+            mc_stopwatch_reset(sw);
+        } else if (sw->running) {
+            mc_stopwatch_stop(sw, now);
+        } else {
+            mc_stopwatch_start(sw, now);
+        }
+        return;
+    }
+    mc_countdown_t *cd = &bank->countdown[s_timer_sel - MC_STOPWATCH_CHANNELS];
+    if (act == KEY_ACT_LONG) {
+        static const uint32_t k_presets[] = {1u * MIN_MS, 3u * MIN_MS, 5u * MIN_MS, 10u * MIN_MS};
+        uint8_t next = 0;
+        for (uint8_t i = 0; i < 4u; ++i) {
+            if (cd->duration_ms == k_presets[i]) {
+                next = (uint8_t)((i + 1u) % 4u);
+            }
+        }
+        mc_countdown_set(cd, k_presets[next]);
+        fw_beep(KEY_BEEP_MS);
+    } else if (cd->running) {
+        mc_countdown_pause(cd, now);
+    } else if (mc_countdown_remaining(cd, now) == 0u) {
+        mc_countdown_reset(cd); /* 到点后再按一下：回到设定值，等下一次启动 */
+    } else {
+        mc_countdown_start(cd, now);
+    }
+}
+
 static void on_key_action(bsp_key_t key, key_act_t act, uint32_t now)
 {
+    /* KEY1 短按在各界面间轮转；设置界面里 KEY1 另有用途，不参与 */
+    if (key == BSP_KEY1 && act == KEY_ACT_CLICK && s_mode != FW_MODE_SET) {
+        static const fw_mode_t k_next[] = {
+            [FW_MODE_CLOCK] = FW_MODE_CAL,   [FW_MODE_SET] = FW_MODE_CLOCK,   [FW_MODE_CAL] = FW_MODE_ALARM,
+            [FW_MODE_ALARM] = FW_MODE_POMO,  [FW_MODE_POMO] = FW_MODE_TIMERS, [FW_MODE_TIMERS] = FW_MODE_CLOCK,
+        };
+        enter_mode(k_next[s_mode], now);
+        return;
+    }
     switch (s_mode) {
     case FW_MODE_SET:
         act_set(key, act, now);
         break;
     case FW_MODE_CAL:
         act_cal(key, act, now);
+        break;
+    case FW_MODE_ALARM:
+        act_alarm(key, act);
+        break;
+    case FW_MODE_POMO:
+        act_pomo(key, act, now);
+        break;
+    case FW_MODE_TIMERS:
+        act_timers(key, act, now);
         break;
     default:
         act_clock(key, act, now);
@@ -272,6 +473,15 @@ static void on_key_action(bsp_key_t key, key_act_t act, uint32_t now)
 }
 
 /* 把 mc_key 的原始事件换成界面用的三种动作。短按在松开时才算：按下那一刻还分不出是短按还是长按的开头 */
+static void stop_ringing(void)
+{
+    s_ringing = false;
+    fw_beep_pattern(0, 0, 0);
+    if (s_lcd_ok && s_mode == FW_MODE_ALARM) {
+        ui_alarm_show(&s_alarm, s_alarm_field, false);
+    }
+}
+
 static void poll_keys(mc_key_t keys[BSP_KEY_COUNT], uint32_t repeat_ms[BSP_KEY_COUNT], uint32_t now)
 {
     for (uint8_t i = 0; i < BSP_KEY_COUNT; ++i) {
@@ -279,18 +489,26 @@ static void poll_keys(mc_key_t keys[BSP_KEY_COUNT], uint32_t repeat_ms[BSP_KEY_C
         switch (mc_key_poll(&keys[i], bsp_key_pressed(key), now)) {
         case MC_KEY_EV_PRESS:
             g_diag.key_press[i]++;
+            if (s_ringing) {
+                stop_ringing();
+                s_swallow[i] = true;
+            }
             break;
         case MC_KEY_EV_RELEASE:
-            if (!keys[i].long_sent) {
+            if (s_swallow[i]) {
+                s_swallow[i] = false;
+            } else if (!keys[i].long_sent) {
                 on_key_action(key, KEY_ACT_CLICK, now);
             }
             break;
         case MC_KEY_EV_LONG:
             repeat_ms[i] = now;
-            on_key_action(key, KEY_ACT_LONG, now);
+            if (!s_swallow[i]) {
+                on_key_action(key, KEY_ACT_LONG, now);
+            }
             break;
         default:
-            if (keys[i].stable && keys[i].long_sent && now - repeat_ms[i] >= KEY_REPEAT_MS) {
+            if (!s_swallow[i] && keys[i].stable && keys[i].long_sent && now - repeat_ms[i] >= KEY_REPEAT_MS) {
                 repeat_ms[i] = now;
                 on_key_action(key, KEY_ACT_REPEAT, now);
             }
@@ -333,6 +551,15 @@ int main(void)
     print_status();
 
     app_init();
+    alarm_load();
+    (void)mc_pomodoro_init(&s_pomo, MC_POMODORO_WORK_MS_DEFAULT, MC_POMODORO_BREAK_MS_DEFAULT);
+    {
+        /* 四路倒计时的默认时长；多路计时界面里长按 KEY_UP 可改 */
+        static const uint32_t k_default_cd[MC_COUNTDOWN_CHANNELS] = {1u * MIN_MS, 3u * MIN_MS, 5u * MIN_MS, 10u * MIN_MS};
+        for (uint8_t i = 0; i < MC_COUNTDOWN_CHANNELS; ++i) {
+            mc_countdown_set(&app_timers()->countdown[i], k_default_cd[i]);
+        }
+    }
     enter_mode(FW_MODE_CLOCK, HAL_GetTick()); /* RTC 状态已知之后再画：RTC 起不来时也有一行红色状态可看 */
 
     mc_key_t keys[BSP_KEY_COUNT];
@@ -341,6 +568,7 @@ int main(void)
     }
     uint32_t repeat_ms[BSP_KEY_COUNT] = {0};
     uint32_t last_key_poll = HAL_GetTick();
+    uint32_t last_live = last_key_poll;
     uint32_t last_second = 0;
     bool have_second = false;
 
@@ -366,6 +594,30 @@ int main(void)
             enter_mode(FW_MODE_CLOCK, now); /* 放弃修改 */
         }
 
+        switch (mc_pomodoro_poll(&s_pomo, now)) {
+        case MC_POMODORO_EV_WORK_DONE:
+            bsp_dbg_puts("pomodoro: work done\r\n");
+            fw_beep_pattern(3, 150, 150);
+            break;
+        case MC_POMODORO_EV_BREAK_DONE:
+            bsp_dbg_puts("pomodoro: break done\r\n");
+            fw_beep_pattern(1, 600, 0);
+            break;
+        default:
+            break;
+        }
+        if (s_ringing && s_beep.left == 0u) { /* 30 s 没人理，自己停 */
+            stop_ringing();
+        }
+        if (s_lcd_ok && now - last_live >= LIVE_REFRESH_MS) {
+            last_live = now;
+            if (s_mode == FW_MODE_POMO) {
+                ui_pomo_show(&s_pomo, now);
+            } else if (s_mode == FW_MODE_TIMERS) {
+                ui_timers_show(app_timers(), s_timer_sel, now);
+            }
+        }
+
         uint32_t s;
         if (g_diag.rtc_ok && bsp_rtc_read(&s) && (!have_second || s != last_second)) {
             have_second = true;
@@ -377,7 +629,18 @@ int main(void)
             s_now_unix = s;
             print_time(&s_now);
             bsp_led_toggle(0); /* DS0 每秒翻转：走时的心跳 */
-            if (s_now.minute == 0u && s_now.second == 0u) {
+            const bool was_enabled = s_alarm.enabled;
+            if (mc_alarm_poll(&s_alarm, &s_now)) {
+                bsp_dbg_puts("alarm\r\n");
+                s_ringing = true;
+                fw_beep_pattern(ALARM_RING_BEEPS, ALARM_RING_MS, ALARM_RING_MS);
+                if (s_alarm.enabled != was_enabled) {
+                    alarm_save(); /* 单次闹钟响过自动关，把「关」也存下来 */
+                }
+                if (s_mode != FW_MODE_SET) { /* 正在设时间就不抢屏，只响 */
+                    enter_mode(FW_MODE_ALARM, now);
+                }
+            } else if (s_now.minute == 0u && s_now.second == 0u && !s_ringing) {
                 fw_beep(CHIME_BEEP_MS);
             }
             draw_clock();

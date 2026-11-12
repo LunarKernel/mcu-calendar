@@ -268,3 +268,199 @@ void ui_cal_show(const mc_calview_t *v, mc_date_t today)
         (void)gfx_text((uint16_t)(cx + text_dx), (uint16_t)(cy + 6u), num, 2, fg, bg);
     }
 }
+
+/* ---- 会跳动的文字：只重画变了的字符 ---- */
+
+/* prev 是上次画上去的内容（cap 字节，含结尾 0）。force 时整行重画（颜色变了、刚清过屏）。
+ * 调用者保证同一位置每次给的 text 等长，短了的部分不会被擦掉 */
+static void live_text(char *prev, size_t cap, uint16_t x, uint16_t y, const char *text, uint8_t scale, uint16_t fg,
+                      uint16_t bg, bool force)
+{
+    for (size_t i = 0; text[i] != '\0' && i + 1u < cap; ++i) {
+        if (force || prev[i] != text[i]) {
+            const char one[2] = {text[i], '\0'};
+            (void)gfx_text((uint16_t)(x + i * 6u * scale), y, one, scale, fg, bg);
+            prev[i] = text[i];
+        }
+    }
+}
+
+/* ---- 闹钟界面 ---- */
+
+#define BIG_SCALE 8u
+#define BIG_CH_W (6u * BIG_SCALE)
+#define BIG_X ((BSP_LCD_W - 5u * BIG_CH_W) / 2u)
+#define BIG_Y 52u
+
+const char *ui_alarm_mode_name(uint8_t weekdays)
+{
+    if (weekdays == MC_ALARM_ONCE) {
+        return "ONCE ";
+    }
+    if (weekdays == MC_ALARM_EVERYDAY) {
+        return "DAILY";
+    }
+    if (weekdays == UI_ALARM_WORKDAYS) {
+        return "MO-FR";
+    }
+    return "DAYS ";
+}
+
+void ui_alarm_init(void)
+{
+    bsp_lcd_fill(0, 0, (uint16_t)(BSP_LCD_W - 1u), (uint16_t)(BSP_LCD_H - 1u), BG);
+    draw_line(8, "ALARM", 3, GFX_YELLOW, true);
+    draw_line(214, "K0 FIELD   UP CHANGE   K1 NEXT", 2, GFX_GRAY, false);
+}
+
+static uint16_t sel_text(uint16_t x, uint16_t y, const char *s, uint8_t scale, bool selected, uint16_t fg)
+{
+    return gfx_text(x, y, s, scale, selected ? GFX_BLACK : fg, selected ? GFX_YELLOW : BG);
+}
+
+void ui_alarm_show(const mc_alarm_t *al, ui_alarm_field_t field, bool ringing)
+{
+    char buf[3];
+    uint16_t x = (uint16_t)BIG_X;
+    *put_num(buf, al->hour, 2) = '\0';
+    x = sel_text(x, BIG_Y, buf, BIG_SCALE, field == UI_ALARM_HOUR, GFX_WHITE);
+    x = gfx_text(x, BIG_Y, ":", BIG_SCALE, GFX_WHITE, BG);
+    *put_num(buf, al->minute, 2) = '\0';
+    (void)sel_text(x, BIG_Y, buf, BIG_SCALE, field == UI_ALARM_MINUTE, GFX_WHITE);
+
+    x = (uint16_t)BIG_X;
+    x = sel_text(x, 136, ui_alarm_mode_name(al->weekdays), 3, field == UI_ALARM_MODE, GFX_CYAN);
+    x = gfx_text(x, 136, "  ", 3, GFX_WHITE, BG);
+    (void)sel_text(x, 136, al->enabled ? "ON " : "OFF", 3, field == UI_ALARM_ENABLE,
+                   al->enabled ? GFX_GREEN : GFX_GRAY);
+
+    draw_line(176, ringing ? "RINGING - PRESS ANY KEY" : "", 2, GFX_RED, true);
+}
+
+/* ---- 番茄钟界面 ---- */
+
+static char s_pomo_big[6];
+static char s_pomo_phase[13];
+static char s_pomo_info[24];
+
+void ui_pomo_init(void)
+{
+    bsp_lcd_fill(0, 0, (uint16_t)(BSP_LCD_W - 1u), (uint16_t)(BSP_LCD_H - 1u), BG);
+    draw_line(8, "POMODORO", 3, GFX_YELLOW, true);
+    draw_line(196, "UP START/PAUSE   K0 STOP", 2, GFX_GRAY, false);
+    draw_line(218, "HOLD K0 PRESET   K1 NEXT", 2, GFX_GRAY, false);
+    memset(s_pomo_big, 0, sizeof s_pomo_big);
+    memset(s_pomo_phase, 0, sizeof s_pomo_phase);
+    memset(s_pomo_info, 0, sizeof s_pomo_info);
+}
+
+/* 剩余毫秒 → 向上取整到秒的 MM:SS（剩 0.3 s 时显示 00:01，归零那一刻才是 00:00），分钟封顶 99 */
+static void fmt_mmss_ceil(char out[6], uint32_t ms)
+{
+    uint32_t s = (ms + 999u) / 1000u;
+    if (s > 99u * 60u + 59u) {
+        s = 99u * 60u + 59u;
+    }
+    char *p = put_num(out, s / 60u, 2);
+    *p++ = ':';
+    *put_num(p, s % 60u, 2) = '\0';
+}
+
+void ui_pomo_show(const mc_pomodoro_t *p, uint32_t now_ms)
+{
+    static const char *const k_phase[] = {"IDLE ", "WORK ", "BREAK"};
+    char text[24];
+
+    /* 颜色随阶段变，所以阶段一变两行都整行重画 */
+    const bool work = p->phase == MC_POMODORO_WORK;
+    char *q = put_str(text, k_phase[p->phase <= MC_POMODORO_BREAK ? p->phase : 0]);
+    q = put_str(q, p->phase != MC_POMODORO_IDLE && !p->running ? " PAUSED" : "       ");
+    *q = '\0';
+    const bool phase_changed = strncmp(text, s_pomo_phase, 5) != 0;
+    live_text(s_pomo_phase, sizeof s_pomo_phase, (uint16_t)BIG_X, 40, text, 3, work ? GFX_RED : GFX_GREEN, BG,
+              phase_changed);
+
+    fmt_mmss_ceil(text, p->phase == MC_POMODORO_IDLE ? p->work_ms : mc_pomodoro_remaining(p, now_ms));
+    live_text(s_pomo_big, sizeof s_pomo_big, (uint16_t)BIG_X, 72, text, BIG_SCALE, GFX_WHITE, BG, phase_changed);
+
+    q = put_str(text, "DONE ");
+    q = put_num(q, p->completed > 999u ? 999u : p->completed, 3);
+    q = put_str(q, "   SET ");
+    q = put_num(q, p->work_ms / 60000u > 99u ? 99u : p->work_ms / 60000u, 2);
+    *q++ = '/';
+    q = put_num(q, p->break_ms / 60000u > 99u ? 99u : p->break_ms / 60000u, 2);
+    *q = '\0';
+    live_text(s_pomo_info, sizeof s_pomo_info, (uint16_t)BIG_X, 150, text, 2, GFX_CYAN, BG, false);
+}
+
+/* ---- 多路秒表与倒计时界面 ---- */
+
+#define TM_ROWS (MC_STOPWATCH_CHANNELS + MC_COUNTDOWN_CHANNELS)
+#define TM_SCALE 3u
+#define TM_Y0 24u
+#define TM_DY 27u
+#define TM_LABEL_X 8u
+#define TM_VALUE_X (TM_LABEL_X + 4u * 6u * TM_SCALE)
+
+static char s_tm_prev[TM_ROWS][14];
+static int s_tm_sel = -1;
+
+void ui_timers_init(void)
+{
+    bsp_lcd_fill(0, 0, (uint16_t)(BSP_LCD_W - 1u), (uint16_t)(BSP_LCD_H - 1u), BG);
+    (void)gfx_text(8, 2, "K0 SEL  UP RUN/STOP  HOLD RESET", 2, GFX_GRAY, BG);
+    memset(s_tm_prev, 0, sizeof s_tm_prev);
+    s_tm_sel = -1;
+}
+
+static void tm_label(uint8_t row, bool selected)
+{
+    char label[4];
+    const bool sw = row < MC_STOPWATCH_CHANNELS;
+    label[0] = sw ? 'S' : 'C';
+    label[1] = sw ? 'W' : 'D';
+    label[2] = (char)('1' + (sw ? row : row - MC_STOPWATCH_CHANNELS));
+    label[3] = '\0';
+    (void)sel_text(TM_LABEL_X, (uint16_t)(TM_Y0 + row * TM_DY), label, TM_SCALE, selected, sw ? GFX_CYAN : GFX_YELLOW);
+}
+
+void ui_timers_show(const mc_timer_bank_t *bank, uint8_t selected, uint32_t now_ms)
+{
+    if ((int)selected != s_tm_sel) {
+        for (uint8_t r = 0; r < TM_ROWS; ++r) {
+            if (s_tm_sel < 0 || r == selected || (int)r == s_tm_sel) {
+                tm_label(r, r == selected);
+            }
+        }
+        s_tm_sel = selected;
+    }
+
+    for (uint8_t r = 0; r < TM_ROWS; ++r) {
+        char text[14];
+        char *p;
+        const char *state;
+        if (r < MC_STOPWATCH_CHANNELS) {
+            const mc_stopwatch_t *sw = &bank->stopwatch[r];
+            uint32_t tenths = mc_stopwatch_elapsed(sw, now_ms) / 100u;
+            if (tenths > 99u * 600u + 599u) { /* 封顶 99:59.9 */
+                tenths = 99u * 600u + 599u;
+            }
+            p = put_num(text, tenths / 600u, 2);
+            *p++ = ':';
+            p = put_num(p, tenths / 10u % 60u, 2);
+            *p++ = '.';
+            p = put_num(p, tenths % 10u, 1);
+            state = sw->running ? "RUN " : "STOP";
+        } else {
+            const mc_countdown_t *cd = &bank->countdown[r - MC_STOPWATCH_CHANNELS];
+            fmt_mmss_ceil(text, mc_countdown_remaining(cd, now_ms));
+            p = put_str(text + 5, "  ");
+            state = cd->running ? "RUN " : cd->fired ? "DONE" : cd->remaining_ms < cd->duration_ms ? "PAUS" : "STOP";
+        }
+        *p++ = ' ';
+        p = put_str(p, state);
+        *p = '\0';
+        live_text(s_tm_prev[r], sizeof s_tm_prev[r], (uint16_t)TM_VALUE_X, (uint16_t)(TM_Y0 + r * TM_DY), text,
+                  TM_SCALE, GFX_WHITE, BG, false);
+    }
+}

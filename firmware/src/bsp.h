@@ -44,6 +44,10 @@ typedef struct {
 void bsp_rtc_init(uint32_t default_s, bsp_rtc_status_t *st);
 bool bsp_rtc_read(uint32_t *seconds);
 bool bsp_rtc_write(uint32_t seconds); /* 同时置「时间已设」标记 */
+/* 备份域里给上层用的两个 16 位寄存器（idx 0、1，对应 BKP_DR2、DR3；DR1 归「时间已设」标记）。
+ * 与 RTC 同在备份域：VBAT 有电才跨断电保持。要在 bsp_rtc_init 之后用 */
+uint16_t bsp_bkp_read(uint8_t idx);
+void bsp_bkp_write(uint8_t idx, uint16_t value);
 bool bsp_rtc_time_set(void); /* 读备份寄存器里的标记；不论经哪条路写的 RTC 都认 */
 
 /* 屏 R61509VE，横屏 400×240，RGB565。

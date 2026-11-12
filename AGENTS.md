@@ -70,7 +70,7 @@ Windows，PATH 里不需要有 cmake / ninja / cl，脚本借用 Visual Studio �
 
 | 项 | 归属 | 说明 |
 |---|---|---|
-| 闹钟、番茄钟的界面与上板 | B（基本功能 3） | 逻辑 2026-10-28 已写成 `core/src/mc_alarm.c`（收当前本地时间）与 `mc_pomodoro.c`（收 `now_ms`），host 已测；未接进 `app/`，未上板。单路秒表与定时可直接用 `mc_timers` |
+| 闹钟、番茄钟、秒表界面 | B（基本功能 3、扩展功能 3） | 逻辑在 `core/`（`mc_alarm`、`mc_pomodoro`、`mc_timers`，host 已测）。界面与按键 2026-11-12 写成：`firmware/src/ui.c` 画，`main.c` 管模式与按键；闹钟、番茄钟的状态放在 `main.c`，没有经 `app/`。上板情况见 `firmware/README.md` |
 | 时间设置、整点报时 | B（基本功能 2） | 编辑逻辑 `core/src/mc_edit.c`（host 已测）；设置界面与按键在 `firmware/src/ui.c`、`main.c`，2026-11-12 写成，上板情况见 `firmware/README.md`。整点报时在 `main.c`（分秒同为 0 时响） |
 | DHT11 | B | 引脚已知（`board.h`），未写 |
 | 屏 | — | 2026-10-29 初始化序列（取自普中例程）、矩形填色、自绘 5×7 字、七段数字、时钟主界面已上板显示正确。没有汉字字库（农历月日名、星期暂用数字与英文缩写）。2026-11-12 加了时间设置与万年历月视图两个界面 |

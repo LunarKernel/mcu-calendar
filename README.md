@@ -17,7 +17,7 @@
 | 基本 4 · 32 位时间戳 | 5 | A | `core/src/mc_date.c` | 算法完成，host 已测 |
 | 扩展 1 · 农历 | 5 | A | `core/src/mc_lunar.c` | 算法完成，全范围已核对 |
 | 扩展 2 · 万年历 1900–2099 | 5 | A | `core/src/mc_calview.c` ＋ `mc_date.c` | 算法完成，host 已测；月视图翻页界面 11/12 写成（`firmware/src/ui.c`） |
-| 扩展 3 · 多秒表多定时 | 5 | A | `core/src/mc_timers.c` | 状态机完成，host 已测；界面未做 |
+| 扩展 3 · 多秒表多定时 | 5 | A | `core/src/mc_timers.c` | 状态机完成，host 已测；四路秒表加四路倒计时的界面 11/12 写成 |
 | 扩展 5 · ESP8266 网络校时 | 5 | A | `core/src/mc_sntp.c` ＋ `app/app.c` | 状态机完成，对脚本化应答已测；**未接真模块** |
 | 整体软件框架 | — | A | `app/` | 骨架与中断分层约定已定 |
 | 固件工程 | — | A | `firmware/` | CMake 工程与上板自检已通过（10/27）；`app/` 已接进应用固件，10/29 上板底座核对过 |

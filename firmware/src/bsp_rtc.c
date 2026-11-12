@@ -132,3 +132,17 @@ bool bsp_rtc_time_set(void)
 {
     return (BKP->DR1 & 0xFFFFu) == TIME_SET_MAGIC;
 }
+
+uint16_t bsp_bkp_read(uint8_t idx)
+{
+    return (uint16_t)((idx == 0u ? BKP->DR2 : BKP->DR3) & 0xFFFFu);
+}
+
+void bsp_bkp_write(uint8_t idx, uint16_t value)
+{
+    if (idx == 0u) {
+        BKP->DR2 = value;
+    } else {
+        BKP->DR3 = value;
+    }
+}
